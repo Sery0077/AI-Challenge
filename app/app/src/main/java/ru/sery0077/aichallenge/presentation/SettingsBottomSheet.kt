@@ -9,7 +9,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.GenericShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Button
@@ -24,8 +24,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -34,7 +32,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import ru.sery0077.aichallenge.ui.theme.AIChallengeTheme
@@ -46,6 +44,7 @@ fun SettingsBottomSheet(
     settings: MainRequestSettings,
     onDismiss: () -> Unit,
     onApply: (MainRequestSettings) -> Unit,
+    onOpenFormattingPreview: () -> Unit,
 ) {
     if (!isOpen) return
 
@@ -53,12 +52,14 @@ fun SettingsBottomSheet(
     val temperature = remember { mutableStateOf(settings.temperature) }
     val stop = remember { mutableStateOf(settings.stop) }
     val streamEnabled = remember { mutableStateOf(settings.streamEnabled) }
+    val useHistory = remember { mutableStateOf(settings.useHistory) }
 
     LaunchedEffect(settings, isOpen) {
         maxTokens.value = settings.maxTokens
         temperature.value = settings.temperature
         stop.value = settings.stop
         streamEnabled.value = settings.streamEnabled
+        useHistory.value = settings.useHistory
     }
 
     val sheetState = rememberModalBottomSheetState(
@@ -75,7 +76,7 @@ fun SettingsBottomSheet(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Параметры запроса", style = MaterialTheme.typography.titleLarge)
+            Text("Request settings", style = MaterialTheme.typography.titleLarge)
 
             OutlinedTextField(
                 value = maxTokens.value,
@@ -86,7 +87,7 @@ fun SettingsBottomSheet(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 trailingIcon = {
                     InfoIconTooltip(
-                        text = "Максимальное количество токенов в ответе. Чем больше, тем длиннее ответ.",
+                        text = "Maximum tokens in the response. Higher values produce longer answers.",
                     )
                 },
             )
@@ -99,18 +100,18 @@ fun SettingsBottomSheet(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 trailingIcon = {
                     InfoIconTooltip(
-                        text = "Температура влияет на креативность. Больше — более разнообразные ответы.",
+                        text = "Temperature affects creativity. Higher values produce more varied answers.",
                     )
                 },
             )
             OutlinedTextField(
                 value = stop.value,
                 onValueChange = { stop.value = it },
-                label = { Text("Stop (через запятую)") },
+                label = { Text("Stop (comma-separated)") },
                 modifier = Modifier.fillMaxWidth(),
                 trailingIcon = {
                     InfoIconTooltip(
-                        text = "Строки-стопы останавливают генерацию при совпадении с ответом. Пример: ###, END",
+                        text = "Stop strings halt generation when matched. Example: ###, END",
                     )
                 },
             )
@@ -124,9 +125,32 @@ fun SettingsBottomSheet(
                     onCheckedChange = { streamEnabled.value = it },
                 )
                 Text(
-                    text = "Stream (частичный ответ)",
+                    text = "Stream (partial response)",
                     style = MaterialTheme.typography.bodyLarge,
                 )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Checkbox(
+                    checked = useHistory.value,
+                    onCheckedChange = { useHistory.value = it },
+                )
+                Text(
+                    text = "Use chat history",
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            }
+            Button(
+                onClick = {
+                    onOpenFormattingPreview()
+                    onDismiss()
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Open formatting preview")
             }
             Button(
                 onClick = {
@@ -136,13 +160,14 @@ fun SettingsBottomSheet(
                             temperature = temperature.value,
                             stop = stop.value,
                             streamEnabled = streamEnabled.value,
+                            useHistory = useHistory.value,
                         ),
                     )
                     onDismiss()
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Применить")
+                Text("Apply")
             }
         }
     }
@@ -155,7 +180,7 @@ private fun InfoIconTooltip(text: String) {
         IconButton(onClick = { expanded = !expanded }) {
             Icon(
                 imageVector = Icons.Filled.Info,
-                contentDescription = "Подсказка",
+                contentDescription = "Hint",
             )
         }
         DropdownMenu(
@@ -195,9 +220,11 @@ private fun SettingsBottomSheetPreview() {
                 temperature = "0.7",
                 stop = "###, END",
                 streamEnabled = true,
+                useHistory = true,
             ),
             onDismiss = {},
             onApply = {},
+            onOpenFormattingPreview = {},
         )
     }
 }

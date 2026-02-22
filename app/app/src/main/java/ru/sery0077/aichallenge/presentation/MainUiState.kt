@@ -1,11 +1,10 @@
 package ru.sery0077.aichallenge.presentation
 
-import androidx.compose.ui.text.AnnotatedString
+import ru.sery0077.aichallenge.domain.model.ChatMessage
 
 data class MainUiState(
     val prompt: String = "",
-    val response: String = "",
-    val formattedResponse: AnnotatedString = AnnotatedString(""),
+    val messages: List<ChatMessage> = emptyList(),
     val isLoading: Boolean = false,
     val error: String? = null,
     val settings: MainRequestSettings = MainRequestSettings(),

@@ -1,5 +1,6 @@
 package ru.sery0077.aichallenge.presentation
 
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -12,7 +13,9 @@ fun MarkdownText(
     text: AnnotatedString,
     modifier: Modifier = Modifier,
 ) {
-    Text(text = text, modifier = modifier)
+    SelectionContainer {
+        Text(text = text, modifier = modifier)
+    }
 }
 
 @Preview(showBackground = true)
@@ -20,7 +23,7 @@ fun MarkdownText(
 private fun MarkdownTextPreview() {
     AIChallengeTheme {
         MarkdownText(
-            text = AnnotatedString("Пример MarkdownText"),
+            text = AnnotatedString("MarkdownText preview"),
         )
     }
 }

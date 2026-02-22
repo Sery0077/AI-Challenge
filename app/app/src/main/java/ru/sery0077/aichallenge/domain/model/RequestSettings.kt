@@ -5,4 +5,5 @@ data class RequestSettings(
     val temperature: Double? = null,
     val stop: List<String>? = null,
     val streamEnabled: Boolean = true,
+    val useHistory: Boolean = true,
 )

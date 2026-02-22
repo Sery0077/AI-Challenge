@@ -8,11 +8,8 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.sp
+import ru.sery0077.aichallenge.domain.model.ChatMessage
+import ru.sery0077.aichallenge.domain.model.ChatRole
 import ru.sery0077.aichallenge.domain.model.RequestSettings
 import ru.sery0077.aichallenge.domain.repository.RouterAIConfigRepository
 import ru.sery0077.aichallenge.domain.usecase.SendPromptUseCase
@@ -20,6 +17,7 @@ import ru.sery0077.aichallenge.domain.usecase.SendPromptUseCase
 class MainViewModel(
     private val sendPromptUseCase: SendPromptUseCase,
     private val configRepository: RouterAIConfigRepository,
+    private val responseTextNormalizer: ResponseTextNormalizer,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MainUiState())
@@ -37,40 +35,60 @@ class MainViewModel(
     fun onApplySettings(value: MainRequestSettings) {
         _uiState.update { it.copy(settings = value) }
     }
-
     fun onSendClick() {
         val stateSnapshot = _uiState.value
-        val prompt = stateSnapshot.prompt
+        val prompt = stateSnapshot.prompt.trim()
         val settings = mapSettings(stateSnapshot.settings)
+        if (prompt.isBlank()) {
+            _uiState.update { it.copy(error = "Enter a message") }
+            return
+        }
+        val userMessage = ChatMessage(role = ChatRole.User, content = prompt)
+        val uiMessages = stateSnapshot.messages + userMessage
+        val requestMessages = if (stateSnapshot.settings.useHistory) {
+            uiMessages
+        } else {
+            listOf(userMessage)
+        }
         _uiState.update {
             it.copy(
                 isLoading = true,
                 error = null,
-                response = "",
-                formattedResponse = AnnotatedString(""),
+                prompt = "",
+                messages = uiMessages + ChatMessage(role = ChatRole.Assistant, content = ""),
             )
         }
         viewModelScope.launch {
-            sendPromptUseCase(prompt, settings)
+            sendPromptUseCase(requestMessages, settings)
                 .onCompletion {
                     _uiState.update { it.copy(isLoading = false) }
                 }
                 .catch { throwable ->
                     _uiState.update {
+                        val updatedMessages = if (it.messages.lastOrNull()?.content.isNullOrBlank()) {
+                            it.messages.dropLast(1)
+                        } else {
+                            it.messages
+                        }
                         it.copy(
                             isLoading = false,
-                            error = throwable.message ?: "Ошибка запроса",
+                            error = throwable.message ?: "Request error",
+                            messages = updatedMessages,
                         )
                     }
                 }
                 .collect { chunk ->
                     _uiState.update { state ->
-                        val updatedResponse = state.response + chunk
-                        val normalizedResponse = normalizeMarkdown(updatedResponse)
-                        state.copy(
-                            response = normalizedResponse,
-                            formattedResponse = buildMarkdownAnnotatedString(normalizedResponse),
-                        )
+                        val updatedMessages = state.messages.toMutableList()
+                        if (updatedMessages.isNotEmpty()) {
+                            val lastMessage = updatedMessages.last()
+                            if (lastMessage.role == ChatRole.Assistant) {
+                                val normalized = responseTextNormalizer.normalize(lastMessage.content + chunk)
+                                updatedMessages[updatedMessages.lastIndex] =
+                                    lastMessage.copy(content = normalized)
+                            }
+                        }
+                        state.copy(messages = updatedMessages)
                     }
                 }
         }
@@ -89,78 +107,8 @@ class MainViewModel(
             temperature = temperature,
             stop = stop,
             streamEnabled = settings.streamEnabled,
+            useHistory = settings.useHistory,
         )
     }
 
-    private fun buildMarkdownAnnotatedString(text: String): AnnotatedString = buildAnnotatedString {
-        val lines = text.split("\n")
-        lines.forEachIndexed { index, line ->
-            val trimmed = line.trimStart()
-            val (style, content) = when {
-                trimmed.startsWith("###") -> SpanStyle(
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.SemiBold,
-                ) to trimmed.removePrefix("###").trimStart()
-                trimmed.startsWith("##") -> SpanStyle(
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.SemiBold,
-                ) to trimmed.removePrefix("##").trimStart()
-                trimmed.startsWith("#") -> SpanStyle(
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                ) to trimmed.removePrefix("#").trimStart()
-                else -> SpanStyle() to line
-            }
-
-            pushStyle(style)
-            appendBoldSegments(content)
-            pop()
-
-            if (index != lines.lastIndex) {
-                append("\n\n")
-            }
-        }
-    }
-
-    private fun AnnotatedString.Builder.appendBoldSegments(text: String) {
-        var index = 0
-        while (index < text.length) {
-            val nextDoubleAsterisk = text.indexOf("**", index)
-            val nextDoubleUnderscore = text.indexOf("__", index)
-            val start = when {
-                nextDoubleAsterisk == -1 -> nextDoubleUnderscore
-                nextDoubleUnderscore == -1 -> nextDoubleAsterisk
-                else -> minOf(nextDoubleAsterisk, nextDoubleUnderscore)
-            }
-
-            if (start == -1) {
-                append(text.substring(index))
-                break
-            }
-
-            if (start > index) {
-                append(text.substring(index, start))
-            }
-
-            val delimiter = if (text.startsWith("**", start)) "**" else "__"
-            val end = text.indexOf(delimiter, start + 2)
-            if (end == -1) {
-                append(text.substring(start))
-                break
-            }
-
-            pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
-            append(text.substring(start + 2, end))
-            pop()
-            index = end + 2
-        }
-    }
-
-    private fun normalizeMarkdown(text: String): String {
-        // Unescape common sequences that can come from JSON text.
-        return text
-            .replace("\\r\\n", "\n")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-    }
 }

@@ -5,4 +5,5 @@ data class MainRequestSettings(
     val temperature: String = "",
     val stop: String = "",
     val streamEnabled: Boolean = true,
+    val useHistory: Boolean = true,
 )

@@ -16,6 +16,7 @@ import ru.sery0077.aichallenge.data.network.dto.ChatRequest
 import ru.sery0077.aichallenge.data.network.dto.ChatResponse
 import ru.sery0077.aichallenge.data.network.dto.ChatStreamChunk
 import ru.sery0077.aichallenge.data.network.dto.MessageDto
+import ru.sery0077.aichallenge.domain.model.ChatMessage
 import ru.sery0077.aichallenge.domain.model.RequestSettings
 import ru.sery0077.aichallenge.domain.repository.RouterAIConfigRepository
 import ru.sery0077.aichallenge.domain.repository.RouterAIRepository
@@ -25,13 +26,15 @@ class RouterAIRepositoryImpl(
     private val json: Json,
     private val configRepository: RouterAIConfigRepository,
 ) : RouterAIRepository {
-    override fun streamPrompt(prompt: String, settings: RequestSettings): Flow<String> = flow {
+    override fun streamChat(messages: List<ChatMessage>, settings: RequestSettings): Flow<String> = flow {
         val baseUrl = configRepository.getBaseUrl()
         val model = configRepository.getModel()
         val apiKey = configRepository.getApiKey()
         val requestBody = ChatRequest(
             model = model,
-            messages = listOf(MessageDto(role = "user", content = prompt)),
+            messages = messages.map { message ->
+                MessageDto(role = message.role.apiName, content = message.content)
+            },
             stream = settings.streamEnabled,
             maxTokens = settings.maxTokens,
             temperature = settings.temperature,

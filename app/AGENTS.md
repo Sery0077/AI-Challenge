@@ -5,6 +5,7 @@
 - Dependency Injection: Koin
 - Navigation: Jetpack Navigation (Navigation3)
 - Networking: Retrofit + OkHttp
+- Local storage: Room
 - AI Router: routerai.ru (OpenAI-compatible API)
 - Architecture: Clean Architecture (domain/data/presentation layers)
 
@@ -12,6 +13,8 @@
 - For Compose functions, add `@Preview`.
 - One file, one class.
 - Prefer DI (Koin) for reusable dependencies instead of constructing them in-place.
+- Feature-based structure: `feature/<name>/{presentation,domain,data}` (e.g. `feature/chat`, `feature/settings`).
+- Shared helpers go in `util/`.
 
 ## Project Summary
 - Android app in Compose to send prompts and receive responses from RouterAI (OpenAI-compatible).

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chat-agent-cli"
+version = "0.1.0"
+description = "Minimal CLI chat agent on Python"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.68.2",
+  "python-dotenv>=1.0.1",
+  "rich>=13.9.4",
+  "typer>=0.15.2",
+]
+
+[project.scripts]
+chat-agent = "chat_agent_cli.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

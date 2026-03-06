@@ -1,0 +1,16 @@
+[agents]
+max_threads = 4
+max_depth = 2
+job_max_runtime_seconds = 1800
+
+[agents.manager]
+description = "Координатор итераций: управляет разработчиком и e2e-тестером, пока не будет достигнут новый подтвержденный результат."
+config_file = "agents/manager.toml"
+
+[agents.developer]
+description = "Разработчик проекта: вносит минимально достаточные изменения и обновляет тесты при изменении поведения."
+config_file = "agents/developer.toml"
+
+[agents.e2e_tester]
+description = "E2E-тестер проекта: проверяет пользовательские сценарии, регрессии и достаточность покрытия."
+config_file = "agents/e2e_tester.toml"

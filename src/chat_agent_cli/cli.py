@@ -5,13 +5,22 @@ import sys
 from datetime import datetime
 
 import typer
+from openai import BadRequestError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .config import load_settings
+from .config import Settings, load_settings
+from .context import ContextManager
 from .llm import ChatModel
-from .storage import ChatStorage, SessionSummary
+from .storage import (
+    BranchRecord,
+    ChatStorage,
+    SessionSummary,
+    SessionSummaryRecord,
+    SessionTokenStats,
+)
+from .tokens import ModelPricing, TokenCounter
 
 if os.name == "nt":
     import msvcrt
@@ -23,7 +32,7 @@ app = typer.Typer(help="Interactive CLI chat agent")
 console = Console()
 
 
-def _build_model() -> tuple[ChatModel, ChatStorage, str]:
+def _build_model() -> tuple[ChatModel, ChatStorage, Settings]:
     try:
         settings = load_settings()
     except ValueError as exc:
@@ -37,31 +46,60 @@ def _build_model() -> tuple[ChatModel, ChatStorage, str]:
     )
     storage = ChatStorage(settings.storage_path)
     storage.init()
-    return model, storage, settings.system_prompt
+    return model, storage, settings
 
 
 def _chat_loop(
     model: ChatModel,
     storage: ChatStorage,
     session_id: str,
-    system_prompt: str,
+    settings: Settings,
     show_history: bool = False,
 ) -> None:
-    messages = storage.load_messages(session_id)
-    if not messages:
-        storage.clear_session(session_id, system_prompt)
-        messages = storage.load_messages(session_id)
+    system_prompt = settings.system_prompt
+    token_counter = TokenCounter(settings.model)
+    session_config = storage.get_session_context_config(session_id)
+    branch_commands_enabled = session_config.strategy == "branching"
+    message_records = storage.load_message_records(session_id)
+    if not message_records:
+        system_tokens = token_counter.count_text(system_prompt)
+        storage.clear_session(session_id, system_prompt, token_count=system_tokens)
+        message_records = storage.load_message_records(session_id)
+    else:
+        if storage.fill_missing_token_counts(session_id, token_counter.count_text) > 0:
+            message_records = storage.load_message_records(session_id)
+    pricing = ModelPricing(
+        input_per_1m=settings.input_cost_per_1m,
+        output_per_1m=settings.output_cost_per_1m,
+    )
+    context_manager = ContextManager(storage=storage, token_counter=token_counter)
+    debug_enabled = False
+
+    title = f"chat-agent | session #{session_id}"
+    if branch_commands_enabled:
+        title += f" | branch {storage.get_active_branch_name(session_id) or 'main'}"
+    commands_line = "Commands: /exit, /clear, /debug, /stats, /summary, /compact"
+    if branch_commands_enabled:
+        commands_line += ", /checkpoint, /branch, /branches, /switch"
 
     console.print(
         Panel(
             "Interactive chat started.\n"
-            "Commands: /exit, /clear",
-            title=f"chat-agent | session #{session_id}",
+            + commands_line,
+            title=title,
             border_style="cyan",
         )
     )
+    if token_counter.fallback:
+        console.print(
+            "[dim yellow]"
+            "tiktoken is not installed, token counts are approximate."
+            "[/dim yellow]"
+        )
     if show_history:
-        _print_chat_history(messages)
+        _print_chat_history(
+            [{"role": row.role, "content": row.content} for row in message_records]
+        )
 
     while True:
         user_text = console.input("[bold green]You:[/bold green] ").strip()
@@ -76,31 +114,361 @@ def _chat_loop(
                 console.print()
                 return
             if command == "/clear":
-                storage.clear_session(session_id, system_prompt)
-                messages = storage.load_messages(session_id)
+                storage.clear_session(
+                    session_id,
+                    system_prompt,
+                    token_count=token_counter.count_text(system_prompt),
+                )
+                message_records = storage.load_message_records(session_id)
                 console.print("[yellow]History cleared.[/yellow]")
                 console.print()
                 continue
+            if command == "/debug":
+                debug_enabled = not debug_enabled
+                state = "enabled" if debug_enabled else "disabled"
+                console.print(f"[yellow]Token debug {state}.[/yellow]")
+                console.print()
+                continue
+            if command == "/stats":
+                _print_session_stats(storage.session_token_stats(session_id), pricing)
+                console.print()
+                continue
+            if command == "/summary":
+                _print_session_summaries(storage.list_session_summaries(session_id))
+                console.print()
+                continue
+            if command == "/compact":
+                try:
+                    summary_saved = _compact_history_with_llm(
+                        model=model,
+                        storage=storage,
+                        session_id=session_id,
+                        token_counter=token_counter,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    console.print(f"[bold red]Compaction failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                if summary_saved:
+                    console.print("[yellow]History compacted into one summary.[/yellow]")
+                else:
+                    console.print("[yellow]Nothing to compact yet.[/yellow]")
+                message_records = storage.load_message_records(session_id)
+                console.print()
+                continue
+            if command == "/checkpoint":
+                if not branch_commands_enabled:
+                    console.print("[yellow]Checkpoint is available only for context=branching.[/yellow]")
+                    console.print()
+                    continue
+                checkpoint_name = user_text[len("/checkpoint"):].strip()
+                if not checkpoint_name:
+                    console.print("[yellow]Usage: /checkpoint <name>[/yellow]")
+                    console.print()
+                    continue
+                try:
+                    checkpoint = storage.create_checkpoint(session_id, checkpoint_name)
+                except ValueError as exc:
+                    console.print(f"[bold red]Checkpoint failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                console.print(
+                    f"[yellow]Checkpoint '{checkpoint.name}' saved on branch "
+                    f"'{checkpoint.branch_name}' at message #{checkpoint.message_id}.[/yellow]"
+                )
+                console.print()
+                continue
+            if command == "/branch":
+                if not branch_commands_enabled:
+                    console.print("[yellow]Branches are available only for context=branching.[/yellow]")
+                    console.print()
+                    continue
+                parts = user_text.split(maxsplit=2)
+                if len(parts) < 3:
+                    console.print("[yellow]Usage: /branch <checkpoint> <new-branch>[/yellow]")
+                    console.print()
+                    continue
+                try:
+                    created_branch = storage.create_branch(session_id, parts[1], parts[2])
+                except Exception as exc:  # pragma: no cover
+                    console.print(f"[bold red]Branch creation failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                console.print(
+                    f"[yellow]Branch '{created_branch.name}' created from "
+                    f"'{created_branch.parent_name}' at message #{created_branch.fork_message_id}.[/yellow]"
+                )
+                console.print()
+                continue
+            if command == "/branches":
+                if not branch_commands_enabled:
+                    console.print("[yellow]Branches are available only for context=branching.[/yellow]")
+                    console.print()
+                    continue
+                _print_branches(storage.list_branches(session_id))
+                console.print()
+                continue
+            if command == "/switch":
+                if not branch_commands_enabled:
+                    console.print("[yellow]Branch switch is available only for context=branching.[/yellow]")
+                    console.print()
+                    continue
+                branch_name = user_text[len("/switch"):].strip()
+                if not branch_name:
+                    console.print("[yellow]Usage: /switch <branch-name>[/yellow]")
+                    console.print()
+                    continue
+                try:
+                    switched = storage.switch_branch(session_id, branch_name)
+                except ValueError as exc:
+                    console.print(f"[bold red]Switch failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                message_records = storage.load_message_records(session_id)
+                console.print(f"[yellow]Switched to branch '{switched.name}'.[/yellow]")
+                console.print()
+                continue
             console.print(
-                "[yellow]Unknown command. Available commands: /exit, /clear[/yellow]"
+                "[yellow]Unknown command. Available commands: "
+                "/exit, /clear, /debug, /stats, /summary, /compact, "
+                "/checkpoint, /branch, /branches, /switch[/yellow]"
             )
             console.print()
             continue
 
-        messages.append({"role": "user", "content": user_text})
-        storage.append_message(session_id, "user", user_text)
+        user_tokens = token_counter.count_text(user_text)
+        storage.append_message(session_id, "user", user_text, token_count=user_tokens)
+        message_records = storage.load_message_records(session_id)
+        context = context_manager.build_messages(
+            session_id=session_id,
+            message_records=message_records,
+        )
+        messages = context.messages
+        estimated_prompt_tokens = token_counter.count_messages(messages)
+        if estimated_prompt_tokens > settings.model_context_limit:
+            console.print(
+                "[dim red]"
+                f"Token warning: estimated prompt {estimated_prompt_tokens} "
+                f"> limit {settings.model_context_limit}. "
+                "Request may fail with context length error."
+                "[/dim red]"
+            )
 
         try:
-            assistant_text = model.reply(messages)
+            console.print("[bold blue]Assistant:[/bold blue] ", end="")
+            reply = model.reply_stream(
+                messages,
+                on_delta=lambda chunk: console.print(
+                    chunk, end="", markup=False, highlight=False
+                ),
+            )
+            console.print()
+        except BadRequestError as exc:  # pragma: no cover
+            console.print()
+            error_text = str(exc)
+            if "maximum context length" in error_text.lower() or "context_length_exceeded" in error_text.lower():
+                console.print(
+                    "[bold red]Request failed:[/bold red] "
+                    "context length exceeded. Use /clear or shorten history."
+                )
+                console.print(
+                    "[dim]"
+                    f"Estimated prompt tokens: {estimated_prompt_tokens} "
+                    f"(limit: {settings.model_context_limit})"
+                    "[/dim]"
+                )
+            else:
+                console.print(f"[bold red]Request failed:[/bold red] {exc}")
+            console.print()
+            message_records = storage.load_message_records(session_id)
+            continue
         except Exception as exc:  # pragma: no cover
+            console.print()
             console.print(f"[bold red]Request failed:[/bold red] {exc}")
             console.print()
+            message_records = storage.load_message_records(session_id)
             continue
 
-        messages.append({"role": "assistant", "content": assistant_text})
-        storage.append_message(session_id, "assistant", assistant_text)
-        console.print(f"[bold blue]Assistant:[/bold blue] {assistant_text}")
+        assistant_text = reply.text
+        assistant_tokens = token_counter.count_text(assistant_text)
+        request_input_tokens = reply.usage.input_tokens if reply.usage else None
+        request_output_tokens = reply.usage.output_tokens if reply.usage else None
+        storage.append_message(
+            session_id,
+            "assistant",
+            assistant_text,
+            token_count=assistant_tokens,
+            request_input_tokens=request_input_tokens,
+            request_output_tokens=request_output_tokens,
+        )
+        message_records = storage.load_message_records(session_id)
+        if debug_enabled:
+            actual_prompt = request_input_tokens if request_input_tokens is not None else estimated_prompt_tokens
+            actual_output = request_output_tokens if request_output_tokens is not None else assistant_tokens
+            estimated_cost = pricing.estimate_cost(actual_prompt, actual_output)
+            console.print(
+                "[dim]"
+                f"tokens: request={user_tokens} prompt={actual_prompt} "
+                f"answer={actual_output} total={actual_prompt + actual_output} "
+                f"cost~${estimated_cost:.6f}"
+                "[/dim]"
+            )
+            if context.summarized_chunks > 0:
+                console.print(
+                    "[dim]"
+                    f"context compression: +{context.summarized_chunks} summary chunk(s)"
+                    "[/dim]"
+                )
         console.print()
+
+
+def _print_session_stats(stats: SessionTokenStats, pricing: ModelPricing) -> None:
+    table = Table(title="Token Stats (current chat history)")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Messages total", str(stats.message_count))
+    table.add_row("User / Assistant / System", f"{stats.user_messages} / {stats.assistant_messages} / {stats.system_messages}")
+    table.add_row("Content tokens total", str(stats.content_tokens))
+    table.add_row("User tokens", str(stats.user_tokens))
+    table.add_row("Assistant tokens", str(stats.assistant_tokens))
+    table.add_row("System tokens", str(stats.system_tokens))
+    table.add_row("Billed input tokens", str(stats.billed_input_tokens))
+    table.add_row("Billed output tokens", str(stats.billed_output_tokens))
+    table.add_row("Billed total tokens", str(stats.billed_total_tokens))
+    if pricing.input_per_1m > 0 or pricing.output_per_1m > 0:
+        table.add_row(
+            "Estimated billed cost",
+            f"${pricing.estimate_cost(stats.billed_input_tokens, stats.billed_output_tokens):.6f}",
+        )
+    console.print(table)
+
+
+def _print_session_summaries(summaries: list[SessionSummaryRecord]) -> None:
+    if not summaries:
+        console.print("[yellow]No summaries yet.[/yellow]")
+        return
+    table = Table(title="Conversation Summary Chunks")
+    table.add_column("No.", justify="right")
+    table.add_column("Range", justify="right")
+    table.add_column("Summary")
+    for index, summary in enumerate(summaries, start=1):
+        table.add_row(
+            str(index),
+            f"{summary.start_message_id}-{summary.end_message_id}",
+            summary.content,
+        )
+    console.print(table)
+
+
+def _print_branches(branches: list[BranchRecord]) -> None:
+    if not branches:
+        console.print("[yellow]No branches yet.[/yellow]")
+        return
+    table = Table(title="Branches")
+    table.add_column("Name")
+    table.add_column("Parent")
+    table.add_column("Fork Msg", justify="right")
+    table.add_column("Active", justify="center")
+    for branch in branches:
+        table.add_row(
+            branch.name,
+            branch.parent_name or "-",
+            str(branch.fork_message_id) if branch.fork_message_id is not None else "-",
+            "yes" if branch.is_active else "",
+        )
+    console.print(table)
+
+
+def _compact_history_with_llm(
+    model: ChatModel,
+    storage: ChatStorage,
+    session_id: str,
+    token_counter: TokenCounter,
+) -> bool:
+    records = storage.load_message_records(session_id)
+    non_system = [row for row in records if row.role != "system" and row.id is not None]
+    if not non_system:
+        return False
+
+    transcript = "\n".join(
+        f"{row.role}: {' '.join(row.content.strip().split())}"
+        for row in non_system
+    )
+    summary_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Summarize chat history compactly. Preserve facts, decisions, "
+                "constraints, and unresolved tasks. Keep it concise."
+            ),
+        },
+        {"role": "user", "content": transcript},
+    ]
+    summary_reply = model.reply(summary_prompt)
+    summary_text = summary_reply.text.strip()
+    if not summary_text:
+        return False
+
+    storage.clear_session_summaries(session_id)
+    storage.append_session_summary(
+        session_id=session_id,
+        start_message_id=int(non_system[0].id),
+        end_message_id=int(non_system[-1].id),
+        summary_text=summary_text,
+        token_count=token_counter.count_text(summary_text),
+    )
+    return True
+
+
+def _print_token_scenarios(settings: Settings) -> None:
+    token_counter = TokenCounter(settings.model)
+    pricing = ModelPricing(
+        input_per_1m=settings.input_cost_per_1m,
+        output_per_1m=settings.output_cost_per_1m,
+    )
+    system = {"role": "system", "content": settings.system_prompt}
+    short_dialog = [
+        system,
+        {"role": "user", "content": "Привет"},
+        {"role": "assistant", "content": "Привет! Чем помочь?"},
+        {"role": "user", "content": "Сделай короткий список задач на день."},
+    ]
+    long_dialog = short_dialog + [
+        {"role": "assistant", "content": "1) Почта 2) Код-ревью 3) Митинг 4) Отчёт"},
+        {"role": "user", "content": "Добавь детали по каждому пункту и риски." * 60},
+        {"role": "assistant", "content": "Детали..." * 200},
+    ]
+    overflow_dialog = long_dialog + [
+        {"role": "user", "content": "Повтори весь диалог и дай итог." * 600}
+    ]
+
+    scenarios = [
+        ("Short dialog", short_dialog),
+        ("Long dialog", long_dialog),
+        ("Overflow dialog", overflow_dialog),
+    ]
+    table = Table(title="Token Growth Scenarios")
+    table.add_column("Scenario")
+    table.add_column("Prompt tokens", justify="right")
+    table.add_column("Vs limit", justify="right")
+    table.add_column("Estimated input cost", justify="right")
+
+    for name, messages in scenarios:
+        prompt_tokens = token_counter.count_messages(messages)
+        pct = (prompt_tokens / settings.model_context_limit) * 100
+        cost = pricing.estimate_cost(prompt_tokens, 0)
+        status = f"{pct:.1f}%"
+        if prompt_tokens > settings.model_context_limit:
+            status = f"{pct:.1f}% (OVER)"
+        table.add_row(name, str(prompt_tokens), status, f"${cost:.6f}")
+
+    console.print(table)
+    console.print(
+        "[dim]"
+        "When prompt tokens exceed model context limit, API request fails with "
+        "context length exceeded (HTTP 400 / context_length_exceeded)."
+        "[/dim]"
+    )
 
 
 def _print_sessions_table(sessions: list[SessionSummary]) -> None:
@@ -214,29 +582,66 @@ def _choose_session_interactive(sessions: list[SessionSummary]) -> str | None:
 
 
 @app.command()
-def chat() -> None:
+def chat(
+    context_strategy: str = typer.Option(
+        "full",
+        "--contenxt",
+        "--context",
+        help="Context strategy: full, sum, sliding, facts, branching",
+    ),
+    summary_after_user_messages: int = typer.Option(
+        10,
+        "--summary-after-user-messages",
+        min=1,
+        help="For context=sum: summarize after this many user messages in old history.",
+    ),
+    window_messages: int = typer.Option(
+        6,
+        "--window-messages",
+        min=1,
+        help="For context=sliding or facts: keep only the last N non-system messages.",
+    ),
+) -> None:
     """Start a new chat session."""
-    model, storage, system_prompt = _build_model()
-    session_id = storage.create_session(system_prompt)
-    _chat_loop(model, storage, session_id, system_prompt)
+    model, storage, settings = _build_model()
+    normalized_strategy = context_strategy.strip().lower()
+    if normalized_strategy not in {"full", "sum", "sliding", "facts", "branching"}:
+        console.print(
+            "[bold red]Invalid --context value. Use 'full', 'sum', 'sliding', "
+            "'facts', or 'branching'.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+    system_tokens = TokenCounter(settings.model).count_text(settings.system_prompt)
+    session_id = storage.create_session(
+        settings.system_prompt,
+        token_count=system_tokens,
+        context_strategy=normalized_strategy,
+        summary_trigger_user_messages=summary_after_user_messages,
+        context_window_messages=window_messages,
+    )
+    _chat_loop(model, storage, session_id, settings)
 
 
 @app.command()
 def resume(session_id: str | None = typer.Option(None, "--id", "-i")) -> None:
     """Resume an existing chat session."""
-    model, storage, system_prompt = _build_model()
+    model, storage, settings = _build_model()
     if session_id is not None:
         if not storage.session_exists(session_id):
             console.print(f"[bold red]Session #{session_id} not found.[/bold red]")
             raise typer.Exit(code=1)
-        _chat_loop(model, storage, session_id, system_prompt, show_history=True)
+        _chat_loop(model, storage, session_id, settings, show_history=True)
         return
 
     sessions = storage.list_sessions(limit=30)
     if not sessions:
         console.print("[yellow]No saved sessions found. Starting a new one.[/yellow]")
-        session_id = storage.create_session(system_prompt)
-        _chat_loop(model, storage, session_id, system_prompt)
+        system_tokens = TokenCounter(settings.model).count_text(settings.system_prompt)
+        session_id = storage.create_session(
+            settings.system_prompt,
+            token_count=system_tokens,
+        )
+        _chat_loop(model, storage, session_id, settings)
         return
 
     _print_sessions_table(sessions)
@@ -244,18 +649,25 @@ def resume(session_id: str | None = typer.Option(None, "--id", "-i")) -> None:
     if chosen_session_id is None:
         console.print("[cyan]Resume canceled.[/cyan]")
         return
-    _chat_loop(model, storage, chosen_session_id, system_prompt, show_history=True)
+    _chat_loop(model, storage, chosen_session_id, settings, show_history=True)
 
 
 @app.command()
 def sessions(limit: int = typer.Option(30, "--limit", "-n")) -> None:
     """Show saved sessions."""
-    _, storage, _ = _build_model()
+    _, storage, _settings = _build_model()
     saved = storage.list_sessions(limit=limit)
     if not saved:
         console.print("[yellow]No saved sessions.[/yellow]")
         return
     _print_sessions_table(saved)
+
+
+@app.command("token-demo")
+def token_demo() -> None:
+    """Show token growth and overflow behavior on synthetic dialogs."""
+    _, _, settings = _build_model()
+    _print_token_scenarios(settings)
 
 
 def main() -> None:

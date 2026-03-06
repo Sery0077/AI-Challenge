@@ -2,8 +2,11 @@
 .env/
 .env.*
 
+.venv
+
 .idea/
 .chat/
+temp/
 __pycache__/
 *.py[cod]
 *.egg-info/

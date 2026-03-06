@@ -13,6 +13,9 @@ class Settings:
     model: str
     system_prompt: str
     storage_path: str
+    model_context_limit: int
+    input_cost_per_1m: float
+    output_cost_per_1m: float
 
 
 def load_settings() -> Settings:
@@ -26,6 +29,9 @@ def load_settings() -> Settings:
         "You are a practical assistant in a terminal chat.",
     ).strip()
     storage_path = os.getenv("CHAT_STORAGE_PATH", ".chat/history.db").strip()
+    model_context_limit = int(os.getenv("MODEL_CONTEXT_LIMIT", "128000").strip())
+    input_cost_per_1m = float(os.getenv("INPUT_COST_PER_1M", "0").strip())
+    output_cost_per_1m = float(os.getenv("OUTPUT_COST_PER_1M", "0").strip())
 
     if not api_key:
         raise ValueError(
@@ -38,4 +44,7 @@ def load_settings() -> Settings:
         model=model,
         system_prompt=system_prompt,
         storage_path=storage_path,
+        model_context_limit=model_context_limit,
+        input_cost_per_1m=input_cost_per_1m,
+        output_cost_per_1m=output_cost_per_1m,
     )

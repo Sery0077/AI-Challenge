@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from .storage import ChatStorage, MessageRecord, SessionContextConfig
 from .tokens import TokenCounter
+from .user_profile import UserProfile
 
 
 _FACT_LABELS = {
@@ -83,9 +84,15 @@ class ContextBuildResult:
 
 
 class ContextManager:
-    def __init__(self, storage: ChatStorage, token_counter: TokenCounter) -> None:
+    def __init__(
+        self,
+        storage: ChatStorage,
+        token_counter: TokenCounter,
+        user_profile: UserProfile | None = None,
+    ) -> None:
         self._storage = storage
         self._token_counter = token_counter
+        self._user_profile = user_profile or UserProfile()
 
     def build_messages(
         self,
@@ -104,42 +111,68 @@ class ContextManager:
                 session_id=session_id,
                 message_records=message_records,
             )
-            return ContextBuildResult(messages=messages, summarized_chunks=summarized_chunks)
+            return ContextBuildResult(
+                messages=self._inject_user_profile(messages),
+                summarized_chunks=summarized_chunks,
+            )
 
         if config.strategy == "sliding":
             return ContextBuildResult(
-                messages=self._build_sliding_messages(message_records, config.window_messages),
+                messages=self._inject_user_profile(
+                    self._build_sliding_messages(message_records, config.window_messages)
+                ),
                 summarized_chunks=0,
             )
 
         if config.strategy == "facts":
             self._refresh_facts(session_id=session_id, message_records=message_records)
             return ContextBuildResult(
-                messages=self._build_fact_messages(session_id, message_records, config.window_messages),
+                messages=self._inject_user_profile(
+                    self._build_fact_messages(session_id, message_records, config.window_messages)
+                ),
                 summarized_chunks=0,
             )
 
         if config.strategy == "memory":
             self._refresh_memory_layers(session_id=session_id, message_records=message_records)
             return ContextBuildResult(
-                messages=self._build_memory_messages(
-                    session_id=session_id,
-                    message_records=message_records,
-                    window_messages=config.window_messages,
+                messages=self._inject_user_profile(
+                    self._build_memory_messages(
+                        session_id=session_id,
+                        message_records=message_records,
+                        window_messages=config.window_messages,
+                    )
                 ),
                 summarized_chunks=0,
             )
 
         if config.strategy == "branching":
             return ContextBuildResult(
-                messages=self._build_branch_messages(session_id, message_records),
+                messages=self._inject_user_profile(
+                    self._build_branch_messages(session_id, message_records)
+                ),
                 summarized_chunks=0,
             )
 
         return ContextBuildResult(
-            messages=[{"role": row.role, "content": row.content} for row in message_records],
+            messages=self._inject_user_profile(
+                [{"role": row.role, "content": row.content} for row in message_records]
+            ),
             summarized_chunks=0,
         )
+
+    def _inject_user_profile(
+        self,
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        profile_message = self._user_profile.to_prompt_message()
+        if profile_message is None:
+            return messages
+
+        insert_at = 1 if messages and messages[0]["role"] == "system" else 0
+        result = list(messages)
+        result.insert(insert_at, profile_message)
+        return result
 
     def _build_sliding_messages(
         self,

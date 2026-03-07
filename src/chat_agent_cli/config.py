@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 class AppSettings:
     system_prompt: str
     storage_path: str
+    user_profile_path: str
 
 
 @dataclass(slots=True)
@@ -40,6 +41,10 @@ class Settings:
     available_model_aliases: tuple[str, ...] = ()
 
 
+def _default_agent_dir() -> Path:
+    return Path.home() / ".chat-agent"
+
+
 def load_app_settings() -> AppSettings:
     load_dotenv()
 
@@ -47,8 +52,19 @@ def load_app_settings() -> AppSettings:
         "SYSTEM_PROMPT",
         "You are a practical assistant in a terminal chat.",
     ).strip()
-    storage_path = os.getenv("CHAT_STORAGE_PATH", ".chat/history.db").strip()
-    return AppSettings(system_prompt=system_prompt, storage_path=storage_path)
+    storage_path = os.getenv(
+        "CHAT_STORAGE_PATH",
+        str(_default_agent_dir() / "history.db"),
+    ).strip()
+    user_profile_path = os.getenv(
+        "CHAT_USER_PROFILE_PATH",
+        str(_default_agent_dir() / "user_profile.json"),
+    ).strip()
+    return AppSettings(
+        system_prompt=system_prompt,
+        storage_path=storage_path,
+        user_profile_path=user_profile_path,
+    )
 
 
 def load_settings(selected_model: str | None = None) -> Settings:
@@ -60,7 +76,10 @@ def load_settings(selected_model: str | None = None) -> Settings:
     model_context_limit = int(os.getenv("MODEL_CONTEXT_LIMIT", "128000").strip())
     input_cost_per_1m = float(os.getenv("INPUT_COST_PER_1M", "0").strip())
     output_cost_per_1m = float(os.getenv("OUTPUT_COST_PER_1M", "0").strip())
-    models_path = os.getenv("CHAT_MODELS_PATH", ".chat/models.toml").strip()
+    models_path = os.getenv(
+        "CHAT_MODELS_PATH",
+        str(_default_agent_dir() / "models.toml"),
+    ).strip()
 
     profiles, configured_default = _load_model_profiles(
         path=Path(models_path),

@@ -23,6 +23,7 @@ from .storage import (
 )
 from .text import normalize_text
 from .tokens import ModelPricing, TokenCounter
+from .user_profile import UserProfile, load_user_profile, set_user_profile_value
 
 if os.name == "nt":
     import msvcrt
@@ -195,6 +196,8 @@ def _chat_loop(
     show_history: bool = False,
 ) -> None:
     system_prompt = normalize_text(settings.system_prompt)
+    app_settings = load_app_settings()
+    user_profile = load_user_profile(app_settings.user_profile_path)
     token_counter = TokenCounter(settings.model)
     session_config = storage.get_session_context_config(session_id)
     branch_commands_enabled = session_config.strategy == "branching"
@@ -211,7 +214,11 @@ def _chat_loop(
         input_per_1m=settings.input_cost_per_1m,
         output_per_1m=settings.output_cost_per_1m,
     )
-    context_manager = ContextManager(storage=storage, token_counter=token_counter)
+    context_manager = ContextManager(
+        storage=storage,
+        token_counter=token_counter,
+        user_profile=user_profile,
+    )
     debug_enabled = False
 
     title = f"chat-agent | session #{session_id} | model {_format_model_label(settings)}"
@@ -321,7 +328,11 @@ def _chat_loop(
                     input_per_1m=settings.input_cost_per_1m,
                     output_per_1m=settings.output_cost_per_1m,
                 )
-                context_manager = ContextManager(storage=storage, token_counter=token_counter)
+                context_manager = ContextManager(
+                    storage=storage,
+                    token_counter=token_counter,
+                    user_profile=user_profile,
+                )
                 console.print(
                     "[yellow]Model switched to "
                     f"{_safe_console_text(_format_model_details(settings))}.[/yellow]"
@@ -662,6 +673,15 @@ def _print_memory_records(title: str, records: list[MemoryRecord]) -> None:
     console.print(table)
 
 
+def _print_user_profile(profile: UserProfile, profile_path: str) -> None:
+    console.print(f"[cyan]User profile path:[/cyan] {_safe_console_text(profile_path)}")
+    profile_message = profile.to_prompt_message()
+    if profile_message is None:
+        console.print("[yellow]User profile is empty.[/yellow]")
+        return
+    console.print(Panel(_safe_console_text(profile_message["content"]), title="User Profile"))
+
+
 def _compact_history_with_llm(
     model: ChatModel,
     storage: ChatStorage,
@@ -975,6 +995,30 @@ def sessions(limit: int = typer.Option(30, "--limit", "-n")) -> None:
         console.print("[yellow]No saved sessions.[/yellow]")
         return
     _print_sessions_table(saved)
+
+
+@app.command("profile-show")
+def profile_show() -> None:
+    """Show the active user profile."""
+    app_settings = load_app_settings()
+    profile = load_user_profile(app_settings.user_profile_path)
+    _print_user_profile(profile, app_settings.user_profile_path)
+
+
+@app.command("profile-set")
+def profile_set(
+    key: str = typer.Argument(..., help="Profile key, e.g. style.verbosity or name"),
+    value: str = typer.Argument(..., help="Profile value"),
+) -> None:
+    """Set one user profile field."""
+    app_settings = load_app_settings()
+    try:
+        profile = set_user_profile_value(app_settings.user_profile_path, key, value)
+    except ValueError as exc:
+        console.print(f"[bold red]Profile update failed:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+    console.print(f"[yellow]Updated profile field '{_safe_console_text(key)}'.[/yellow]")
+    _print_user_profile(profile, app_settings.user_profile_path)
 
 
 @app.command("token-demo")

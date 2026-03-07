@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
 
-from chat_agent_cli.config import load_settings
+from chat_agent_cli.config import load_app_settings, load_settings
+
+
+def test_load_app_settings_uses_home_chat_agent_defaults(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CHAT_STORAGE_PATH", raising=False)
+    monkeypatch.delenv("CHAT_USER_PROFILE_PATH", raising=False)
+
+    app_settings = load_app_settings()
+
+    assert app_settings.storage_path == str(tmp_path / ".chat-agent" / "history.db")
+    assert app_settings.user_profile_path == str(tmp_path / ".chat-agent" / "user_profile.json")
 
 
 def test_load_settings_uses_model_profiles_from_toml(monkeypatch, tmp_path) -> None:
@@ -46,6 +58,35 @@ def test_load_settings_uses_model_profiles_from_toml(monkeypatch, tmp_path) -> N
     assert settings.base_url == "http://localhost:11434/v1"
     assert settings.model_context_limit == 32000
     assert settings.available_model_aliases == ("remote", "local")
+
+
+def test_load_settings_uses_home_chat_agent_models_path_by_default(monkeypatch, tmp_path) -> None:
+    models_dir = tmp_path / ".chat-agent"
+    models_dir.mkdir(parents=True)
+    models_path = models_dir / "models.toml"
+    models_path.write_text(
+        textwrap.dedent(
+            """
+            default_model = "routerai"
+
+            [models.routerai]
+            api_key = "secret"
+            base_url = "https://routerai.ru/api/v1"
+            model = "deepseek/deepseek-v3.2"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CHAT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    settings = load_settings()
+
+    assert settings.model_alias == "routerai"
+    assert settings.model == "deepseek/deepseek-v3.2"
+    assert settings.base_url == "https://routerai.ru/api/v1"
 
 
 def test_load_settings_falls_back_to_env_for_raw_model_override(monkeypatch) -> None:

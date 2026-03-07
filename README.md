@@ -18,10 +18,11 @@
 - `OPENAI_API_KEY` - API ключ (обязательно)
 - `OPENAI_BASE_URL` - базовый URL API (опционально)
 - `OPENAI_MODEL` - модель (по умолчанию `gpt-4.1-mini`)
-- `CHAT_MODELS_PATH` - путь к TOML-файлу с профилями моделей (по умолчанию `.chat/models.toml`)
+- `CHAT_MODELS_PATH` - путь к TOML-файлу с профилями моделей (по умолчанию `~/.chat-agent/models.toml`)
 - `CHAT_DEFAULT_MODEL` - alias профиля по умолчанию из `CHAT_MODELS_PATH` (опционально)
 - `SYSTEM_PROMPT` - системный промпт (опционально)
-- `CHAT_STORAGE_PATH` - путь к SQLite БД (по умолчанию `.chat/history.db`)
+- `CHAT_STORAGE_PATH` - путь к SQLite БД (по умолчанию `~/.chat-agent/history.db`)
+- `CHAT_USER_PROFILE_PATH` - путь к JSON-профилю пользователя (по умолчанию `~/.chat-agent/user_profile.json`)
 - `MODEL_CONTEXT_LIMIT` - лимит контекста модели для предупреждений и demo (по умолчанию `128000`)
 - `INPUT_COST_PER_1M` - цена входных токенов за 1M токенов (по умолчанию `0`)
 - `OUTPUT_COST_PER_1M` - цена выходных токенов за 1M токенов (по умолчанию `0`)
@@ -30,7 +31,7 @@
 
 Если нужен быстрый fallback, можно по-прежнему использовать один набор `OPENAI_*` переменных.
 
-Если нужно переключаться между локальной и удалённой моделями, создайте `.chat/models.toml`:
+Если нужно переключаться между локальной и удалённой моделями, создайте `~/.chat-agent/models.toml`:
 
 ```toml
 default_model = "remote"
@@ -69,6 +70,8 @@ output_cost_per_1m = 0
 - `chat-agent resume --id <session_id>` - продолжить конкретную сессию
 - `chat-agent resume --id <session_id> --model remote` - продолжить сессию и переключить её на другой профиль
 - `chat-agent sessions` - показать список сохраненных сессий
+- `chat-agent profile-show` - показать активный профиль пользователя
+- `chat-agent profile-set style.verbosity short` - обновить одно поле профиля пользователя
 - `chat-agent token-demo` - сравнить короткий/длинный/переполненный диалоги по токенам и стоимости
 
 ### Стратегия контекста при создании сессии
@@ -98,6 +101,51 @@ output_cost_per_1m = 0
 - `/switch <branch-name>` - переключиться на другую ветку (`context=branching`)
 
 Выбранный профиль модели сохраняется в сессии. При обычном `resume` чат продолжится на той же модели, а `--model` и `/model` меняют это значение.
+
+## Профиль пользователя
+
+Агент поддерживает глобальный профиль пользователя, который автоматически добавляется в каждый запрос к модели как отдельный system-блок.
+
+Пример `~/.chat-agent/user_profile.json`:
+
+```json
+{
+  "user_id": "default",
+  "name": "Алексей",
+  "preferences": {
+    "style": {
+      "tone": "neutral",
+      "verbosity": "short",
+      "explanation_level": "practical"
+    },
+    "format": {
+      "prefer_bullets": true,
+      "prefer_examples": true
+    },
+    "constraints": {
+      "answer_language": "ru",
+      "no_emojis": true,
+      "max_paragraphs": 3
+    }
+  }
+}
+```
+
+Как это работает:
+
+- профиль хранится отдельно от истории чата;
+- при каждом запросе он автоматически подмешивается в контекст;
+- если пользователь в текущем сообщении явно просит другой стиль, это важнее профиля.
+
+Быстрая настройка:
+
+```bash
+chat-agent profile-set name Алексей
+chat-agent profile-set style.verbosity short
+chat-agent profile-set format.prefer_bullets true
+chat-agent profile-set constraints.answer_language ru
+chat-agent profile-show
+```
 
 ## Явная модель памяти
 

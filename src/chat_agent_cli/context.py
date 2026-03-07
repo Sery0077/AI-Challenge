@@ -48,6 +48,32 @@ _EXPLICIT_FACT_RE = re.compile(
 _IS_FACT_RE = re.compile(
     r"(?i)\b(?P<key>goal|constraint|preference|decision|agreement|deadline|budget|owner|codeword|stack|storage|database)\b\s+is\s+(?P<value>[^.;\n]+)"
 )
+_WORKING_MEMORY_KEYS = {
+    "goal",
+    "task",
+    "constraint",
+    "agreement",
+    "deadline",
+    "budget",
+    "codeword",
+    "storage",
+    "branch",
+    "database",
+    "deliverable",
+    "status",
+    "risk",
+}
+_LONG_TERM_MEMORY_KEYS = {
+    "owner",
+    "preference",
+    "decision",
+    "profile",
+    "knowledge",
+    "stack",
+}
+_EXPLICIT_MEMORY_LAYER_RE = re.compile(
+    r"(?i)^(?P<layer>working|work|long|long_term|long-term|рабочая|долговременная)\s*:\s*(?P<body>.+)$"
+)
 
 
 @dataclass(slots=True)
@@ -90,6 +116,17 @@ class ContextManager:
             self._refresh_facts(session_id=session_id, message_records=message_records)
             return ContextBuildResult(
                 messages=self._build_fact_messages(session_id, message_records, config.window_messages),
+                summarized_chunks=0,
+            )
+
+        if config.strategy == "memory":
+            self._refresh_memory_layers(session_id=session_id, message_records=message_records)
+            return ContextBuildResult(
+                messages=self._build_memory_messages(
+                    session_id=session_id,
+                    message_records=message_records,
+                    window_messages=config.window_messages,
+                ),
                 summarized_chunks=0,
             )
 
@@ -141,6 +178,50 @@ class ContextManager:
         messages.insert(insert_at, fact_message)
         return messages
 
+    def _build_memory_messages(
+        self,
+        session_id: str,
+        message_records: list[MessageRecord],
+        window_messages: int,
+    ) -> list[dict[str, str]]:
+        messages = self._build_sliding_messages(message_records, window_messages)
+        inserts: list[dict[str, str]] = []
+
+        working_memory = self._storage.list_working_memory(session_id)
+        if working_memory:
+            working_lines = "\n".join(
+                f"{item.key}: {item.value}" for item in working_memory
+            )
+            inserts.append(
+                {
+                    "role": "system",
+                    "content": "Working memory (current task):\n" + working_lines,
+                }
+            )
+
+        long_term_memory = self._storage.list_long_term_memory(session_id)
+        if long_term_memory:
+            long_term_lines = "\n".join(
+                f"{item.key}: {item.value}" for item in long_term_memory
+            )
+            inserts.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Long-term memory (profile, preferences, stable decisions, knowledge):\n"
+                        + long_term_lines
+                    ),
+                }
+            )
+
+        if not inserts:
+            return messages
+
+        insert_at = 1 if messages and messages[0]["role"] == "system" else 0
+        for offset, item in enumerate(inserts):
+            messages.insert(insert_at + offset, item)
+        return messages
+
     def _build_branch_messages(
         self,
         session_id: str,
@@ -178,6 +259,40 @@ class ContextManager:
         facts = [(key, facts_by_key[key]) for key in ordered_keys]
         self._storage.replace_session_facts(session_id, facts)
 
+    def _refresh_memory_layers(
+        self,
+        session_id: str,
+        message_records: list[MessageRecord],
+    ) -> None:
+        working_order: list[str] = []
+        working_values: dict[str, str] = {}
+        long_term_order: list[str] = []
+        long_term_values: dict[str, str] = {}
+
+        for row in message_records:
+            if row.role != "user":
+                continue
+            for layer, key, value in self._extract_memory_items(row.content):
+                if layer == "long_term":
+                    if key in long_term_values:
+                        long_term_order.remove(key)
+                    long_term_values[key] = value
+                    long_term_order.append(key)
+                    continue
+                if key in working_values:
+                    working_order.remove(key)
+                working_values[key] = value
+                working_order.append(key)
+
+        self._storage.replace_working_memory(
+            session_id,
+            [(key, working_values[key]) for key in working_order],
+        )
+        self._storage.replace_long_term_memory(
+            session_id,
+            [(key, long_term_values[key]) for key in long_term_order],
+        )
+
     def _extract_facts(self, text: str) -> list[tuple[str, str]]:
         facts: list[tuple[str, str]] = []
 
@@ -194,6 +309,45 @@ class ContextManager:
                 facts.append((key, value))
 
         return facts
+
+    def _extract_memory_items(self, text: str) -> list[tuple[str, str, str]]:
+        items: list[tuple[str, str, str]] = []
+        for segment in self._split_segments(text):
+            items.extend(self._extract_memory_segment(segment))
+        return items
+
+    def _extract_memory_segment(self, segment: str) -> list[tuple[str, str, str]]:
+        forced_layer: str | None = None
+        body = segment
+        explicit = _EXPLICIT_MEMORY_LAYER_RE.match(segment)
+        if explicit is not None:
+            forced_layer = self._normalize_memory_layer(explicit.group("layer"))
+            body = explicit.group("body").strip()
+
+        items: list[tuple[str, str, str]] = []
+        for key, value in self._extract_facts(body):
+            layer = forced_layer or self._route_memory_layer(key)
+            items.append((layer, key, value))
+        return items
+
+    @staticmethod
+    def _split_segments(text: str) -> list[str]:
+        return [segment.strip() for segment in re.split(r"[;\n]+", text) if segment.strip()]
+
+    @staticmethod
+    def _normalize_memory_layer(raw_layer: str) -> str:
+        layer = raw_layer.strip().lower().replace("-", "_").replace(" ", "_")
+        if layer in {"long", "long_term", "долговременная"}:
+            return "long_term"
+        return "working"
+
+    @staticmethod
+    def _route_memory_layer(key: str) -> str:
+        if key in _LONG_TERM_MEMORY_KEYS:
+            return "long_term"
+        if key in _WORKING_MEMORY_KEYS:
+            return "working"
+        return "working"
 
     @staticmethod
     def _normalize_fact_key(raw_key: str) -> str | None:

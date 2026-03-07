@@ -7,6 +7,8 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Callable
 
+from .text import normalize_text
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -18,6 +20,7 @@ class SessionSummary:
     title: str
     updated_at: str
     message_count: int
+    model_alias: str | None = None
 
 
 @dataclass(slots=True)
@@ -65,6 +68,12 @@ class SessionFactRecord:
 
 
 @dataclass(slots=True)
+class MemoryRecord:
+    key: str
+    value: str
+
+
+@dataclass(slots=True)
 class BranchRecord:
     name: str
     parent_name: str | None
@@ -96,6 +105,7 @@ class ChatStorage:
                     context_strategy TEXT NOT NULL DEFAULT 'full',
                     summary_trigger_user_messages INTEGER NOT NULL DEFAULT 10,
                     context_window_messages INTEGER NOT NULL DEFAULT 6,
+                    model_alias TEXT,
                     active_branch_id INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -147,6 +157,32 @@ class ChatStorage:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS session_working_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    memory_key TEXT NOT NULL,
+                    memory_value TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_long_term_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    memory_key TEXT NOT NULL,
+                    memory_value TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS session_branches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL,
@@ -173,6 +209,7 @@ class ChatStorage:
             )
             self._migrate_session_key(conn)
             self._migrate_sessions_context(conn)
+            self._migrate_sessions_models(conn)
             self._migrate_messages_tokens(conn)
             conn.execute(
                 """
@@ -194,6 +231,18 @@ class ChatStorage:
             )
             conn.execute(
                 """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_session_working_memory_key
+                ON session_working_memory(session_id, memory_key)
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_session_long_term_memory_key
+                ON session_long_term_memory(session_id, memory_key)
+                """
+            )
+            conn.execute(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_branch_checkpoints_name
                 ON branch_checkpoints(session_id, name)
                 """
@@ -207,9 +256,14 @@ class ChatStorage:
         context_strategy: str = "full",
         summary_trigger_user_messages: int = 10,
         context_window_messages: int = 6,
+        model_alias: str | None = None,
     ) -> str:
         now = _now_iso()
         session_key = self._new_session_key()
+        safe_system_prompt = normalize_text(system_prompt)
+        safe_model_alias = normalize_text(model_alias).strip() if model_alias is not None else None
+        if safe_model_alias == "":
+            safe_model_alias = None
         with sqlite3.connect(self._path) as conn:
             cursor = conn.execute(
                 """
@@ -218,16 +272,18 @@ class ChatStorage:
                     context_strategy,
                     summary_trigger_user_messages,
                     context_window_messages,
+                    model_alias,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_key,
                     context_strategy,
                     summary_trigger_user_messages,
                     context_window_messages,
+                    safe_model_alias,
                     now,
                     now,
                 ),
@@ -251,7 +307,7 @@ class ChatStorage:
                 INSERT INTO messages (session_id, branch_id, role, content, token_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (db_session_id, None, "system", system_prompt, token_count, now),
+                (db_session_id, None, "system", safe_system_prompt, token_count, now),
             )
             conn.commit()
             return session_key
@@ -272,7 +328,8 @@ class ChatStorage:
                     s.session_key,
                     s.title,
                     s.updated_at,
-                    COUNT(m.id) AS message_count
+                    COUNT(m.id) AS message_count,
+                    s.model_alias
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.id
                 GROUP BY s.id
@@ -288,6 +345,7 @@ class ChatStorage:
                 title=str(row[1]),
                 updated_at=str(row[2]),
                 message_count=int(row[3]),
+                model_alias=str(row[4]) if row[4] is not None and str(row[4]).strip() else None,
             )
             for row in rows
         ]
@@ -334,6 +392,31 @@ class ChatStorage:
             window_messages=int(row[2] or 6),
         )
 
+    def get_session_model_alias(self, session_id: str) -> str | None:
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                "SELECT model_alias FROM sessions WHERE session_key = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        model_alias = str(row[0]).strip()
+        return model_alias or None
+
+    def set_session_model_alias(self, session_id: str, model_alias: str | None) -> None:
+        now = _now_iso()
+        normalized_alias = (
+            normalize_text(model_alias).strip() if model_alias is not None else None
+        )
+        if normalized_alias == "":
+            normalized_alias = None
+        with sqlite3.connect(self._path) as conn:
+            conn.execute(
+                "UPDATE sessions SET model_alias = ?, updated_at = ? WHERE session_key = ?",
+                (normalized_alias, now, session_id),
+            )
+            conn.commit()
+
     def list_session_summaries(self, session_id: str) -> list[SessionSummaryRecord]:
         with sqlite3.connect(self._path) as conn:
             rows = conn.execute(
@@ -365,6 +448,7 @@ class ChatStorage:
         token_count: int | None = None,
     ) -> None:
         now = _now_iso()
+        safe_summary_text = normalize_text(summary_text)
         with sqlite3.connect(self._path) as conn:
             db_session_id = self._get_db_session_id(conn, session_id)
             conn.execute(
@@ -383,7 +467,7 @@ class ChatStorage:
                     db_session_id,
                     start_message_id,
                     end_message_id,
-                    summary_text,
+                    safe_summary_text,
                     token_count,
                     now,
                 ),
@@ -417,6 +501,8 @@ class ChatStorage:
                 (db_session_id,),
             )
             for position, (key, value) in enumerate(facts, start=1):
+                safe_key = normalize_text(key)
+                safe_value = normalize_text(value)
                 conn.execute(
                     """
                     INSERT INTO session_facts (
@@ -428,7 +514,7 @@ class ChatStorage:
                     )
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (db_session_id, key, value, position, now),
+                    (db_session_id, safe_key, safe_value, position, now),
                 )
             conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
@@ -453,8 +539,42 @@ class ChatStorage:
             for row in rows
         ]
 
+    def replace_working_memory(
+        self,
+        session_id: str,
+        items: list[tuple[str, str]],
+    ) -> None:
+        self._replace_memory_table(
+            session_id=session_id,
+            table_name="session_working_memory",
+            items=items,
+        )
+
+    def list_working_memory(self, session_id: str) -> list[MemoryRecord]:
+        return self._list_memory_table(
+            session_id=session_id,
+            table_name="session_working_memory",
+        )
+
+    def replace_long_term_memory(
+        self,
+        session_id: str,
+        items: list[tuple[str, str]],
+    ) -> None:
+        self._replace_memory_table(
+            session_id=session_id,
+            table_name="session_long_term_memory",
+            items=items,
+        )
+
+    def list_long_term_memory(self, session_id: str) -> list[MemoryRecord]:
+        return self._list_memory_table(
+            session_id=session_id,
+            table_name="session_long_term_memory",
+        )
+
     def create_checkpoint(self, session_id: str, name: str) -> CheckpointRecord:
-        checkpoint_name = name.strip()
+        checkpoint_name = normalize_text(name).strip()
         if not checkpoint_name:
             raise ValueError("Checkpoint name cannot be empty")
 
@@ -520,7 +640,8 @@ class ChatStorage:
         ]
 
     def create_branch(self, session_id: str, checkpoint_name: str, branch_name: str) -> BranchRecord:
-        normalized_name = branch_name.strip()
+        safe_checkpoint_name = normalize_text(checkpoint_name).strip()
+        normalized_name = normalize_text(branch_name).strip()
         if not normalized_name:
             raise ValueError("Branch name cannot be empty")
 
@@ -535,10 +656,10 @@ class ChatStorage:
                 JOIN session_branches parent ON parent.id = bc.branch_id
                 WHERE bc.session_id = ? AND bc.name = ?
                 """,
-                (db_session_id, checkpoint_name),
+                (db_session_id, safe_checkpoint_name),
             ).fetchone()
             if checkpoint is None:
-                raise ValueError(f"Checkpoint '{checkpoint_name}' not found")
+                raise ValueError(f"Checkpoint '{safe_checkpoint_name}' not found")
             parent_branch_id = int(checkpoint[0])
             fork_message_id = int(checkpoint[1])
             parent_name = str(checkpoint[2])
@@ -587,7 +708,7 @@ class ChatStorage:
         ]
 
     def switch_branch(self, session_id: str, branch_name: str) -> BranchRecord:
-        normalized_name = branch_name.strip()
+        normalized_name = normalize_text(branch_name).strip()
         if not normalized_name:
             raise ValueError("Branch name cannot be empty")
 
@@ -646,6 +767,7 @@ class ChatStorage:
         request_output_tokens: int | None = None,
     ) -> None:
         now = _now_iso()
+        safe_content = normalize_text(content)
         with sqlite3.connect(self._path) as conn:
             db_session_id = self._get_db_session_id(conn, session_id)
             branch_id = None
@@ -669,7 +791,7 @@ class ChatStorage:
                     db_session_id,
                     branch_id,
                     role,
-                    content,
+                    safe_content,
                     token_count,
                     request_input_tokens,
                     request_output_tokens,
@@ -681,7 +803,7 @@ class ChatStorage:
                 (now, session_id),
             )
             if role == "user":
-                self._maybe_set_title(conn, session_id, content)
+                self._maybe_set_title(conn, session_id, safe_content)
             conn.commit()
 
     def fill_missing_token_counts(
@@ -770,12 +892,15 @@ class ChatStorage:
         token_count: int | None = None,
     ) -> None:
         now = _now_iso()
+        safe_system_prompt = normalize_text(system_prompt)
         with sqlite3.connect(self._path) as conn:
             db_session_id = self._get_db_session_id(conn, session_id)
             strategy = self._get_context_strategy(conn, session_id)
             conn.execute("DELETE FROM messages WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM session_facts WHERE session_id = ?", (db_session_id,))
+            conn.execute("DELETE FROM session_working_memory WHERE session_id = ?", (db_session_id,))
+            conn.execute("DELETE FROM session_long_term_memory WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM branch_checkpoints WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM session_branches WHERE session_id = ?", (db_session_id,))
 
@@ -794,7 +919,7 @@ class ChatStorage:
                 INSERT INTO messages (session_id, branch_id, role, content, token_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (db_session_id, None, "system", system_prompt, token_count, now),
+                (db_session_id, None, "system", safe_system_prompt, token_count, now),
             )
             conn.execute(
                 """
@@ -815,7 +940,7 @@ class ChatStorage:
         if row is None or row[0] != "Untitled session":
             return
 
-        title = " ".join(content.strip().split())
+        title = normalize_text(" ".join(content.strip().split()))
         if not title:
             return
         if len(title) > 70:
@@ -886,6 +1011,14 @@ class ChatStorage:
             conn.execute("ALTER TABLE sessions ADD COLUMN active_branch_id INTEGER")
 
     @staticmethod
+    def _migrate_sessions_models(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "model_alias" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN model_alias TEXT")
+
+    @staticmethod
     def _migrate_messages_tokens(conn: sqlite3.Connection) -> None:
         columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(messages)").fetchall()
@@ -910,6 +1043,59 @@ class ChatStorage:
             )
             for row in rows
         ]
+
+    def _replace_memory_table(
+        self,
+        session_id: str,
+        table_name: str,
+        items: list[tuple[str, str]],
+    ) -> None:
+        now = _now_iso()
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            conn.execute(
+                f"DELETE FROM {table_name} WHERE session_id = ?",
+                (db_session_id,),
+            )
+            for position, (key, value) in enumerate(items, start=1):
+                safe_key = normalize_text(key)
+                safe_value = normalize_text(value)
+                conn.execute(
+                    f"""
+                    INSERT INTO {table_name} (
+                        session_id,
+                        memory_key,
+                        memory_value,
+                        position,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (db_session_id, safe_key, safe_value, position, now),
+                )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+    def _list_memory_table(
+        self,
+        session_id: str,
+        table_name: str,
+    ) -> list[MemoryRecord]:
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT memory_key, memory_value
+                FROM {table_name} stm
+                JOIN sessions s ON s.id = stm.session_id
+                WHERE s.session_key = ?
+                ORDER BY stm.position ASC, stm.id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [MemoryRecord(key=str(row[0]), value=str(row[1])) for row in rows]
 
     def _load_branching_message_records(
         self,
@@ -1070,7 +1256,13 @@ class ChatStorage:
             )
             VALUES (?, ?, ?, ?, ?)
             """,
-            (db_session_id, name, parent_branch_id, fork_message_id, created_at),
+            (
+                db_session_id,
+                normalize_text(name),
+                parent_branch_id,
+                fork_message_id,
+                created_at,
+            ),
         )
         return int(cursor.lastrowid)
 

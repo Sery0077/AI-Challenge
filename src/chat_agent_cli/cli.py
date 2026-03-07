@@ -10,16 +10,18 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .config import Settings, load_settings
+from .config import Settings, load_app_settings, load_settings
 from .context import ContextManager
 from .llm import ChatModel
 from .storage import (
     BranchRecord,
     ChatStorage,
+    MemoryRecord,
     SessionSummary,
     SessionSummaryRecord,
     SessionTokenStats,
 )
+from .text import normalize_text
 from .tokens import ModelPricing, TokenCounter
 
 if os.name == "nt":
@@ -31,21 +33,157 @@ else:
 app = typer.Typer(help="Interactive CLI chat agent")
 console = Console()
 
+def _safe_console_text(value: object) -> str:
+    return normalize_text(str(value))
 
-def _build_model() -> tuple[ChatModel, ChatStorage, Settings]:
-    try:
-        settings = load_settings()
-    except ValueError as exc:
-        console.print(f"[bold red]Config error:[/bold red] {exc}")
-        raise typer.Exit(code=1)
 
-    model = ChatModel(
+def _format_model_label(settings: Settings) -> str:
+    if settings.model_alias:
+        return f"{settings.model_alias} ({settings.model})"
+    return settings.model
+
+
+def _format_model_details(settings: Settings) -> str:
+    details = _format_model_label(settings)
+    if settings.base_url:
+        return f"{details} @ {settings.base_url}"
+    return details
+
+
+def _print_current_model(settings: Settings) -> None:
+    console.print(
+        f"[cyan]Current model:[/cyan] {_safe_console_text(_format_model_details(settings))}"
+    )
+
+
+def _print_model_selection(settings: Settings) -> None:
+    _print_current_model(settings)
+    if settings.available_model_aliases:
+        _print_model_profiles_table(settings)
+        console.print(
+            "[dim]Use /model <alias> for direct switch or choose a number in interactive mode.[/dim]"
+        )
+        return
+    console.print(
+        "[dim]No named model profiles configured. "
+        "Use /model <raw-model-name> with current OPENAI_* settings.[/dim]"
+    )
+
+
+def _choose_model_interactive(settings: Settings) -> str | None:
+    aliases = settings.available_model_aliases
+    if not aliases:
+        return None
+
+    if not sys.stdin.isatty():
+        while True:
+            selected = console.input(
+                "[bold green]Choose model number (or /cancel):[/bold green] "
+            ).strip()
+            if selected == "/cancel":
+                return None
+            if not selected.isdigit():
+                console.print("[yellow]Please enter a valid number.[/yellow]")
+                continue
+            idx = int(selected)
+            if idx < 1 or idx > len(aliases):
+                console.print("[yellow]Number out of range.[/yellow]")
+                continue
+            return aliases[idx - 1]
+
+    console.print("[bold green]Choose model number (Esc to cancel):[/bold green] ", end="")
+    typed = ""
+    while True:
+        key = _read_single_key()
+        if key == "\x1b":
+            console.print()
+            return None
+        if key in {"\r", "\n"}:
+            console.print()
+            if not typed:
+                console.print("[yellow]Please enter a valid number.[/yellow]")
+                console.print(
+                    "[bold green]Choose model number (Esc to cancel):[/bold green] ",
+                    end="",
+                )
+                continue
+            idx = int(typed)
+            if idx < 1 or idx > len(aliases):
+                console.print("[yellow]Number out of range.[/yellow]")
+                typed = ""
+                console.print(
+                    "[bold green]Choose model number (Esc to cancel):[/bold green] ",
+                    end="",
+                )
+                continue
+            return aliases[idx - 1]
+        if key in {"\x7f", "\b"}:
+            if typed:
+                typed = typed[:-1]
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        if key.isdigit():
+            typed += key
+            sys.stdout.write(key)
+            sys.stdout.flush()
+
+
+def _switch_chat_model(
+    session_id: str,
+    storage: ChatStorage,
+    target_model: str,
+) -> tuple[ChatModel, Settings]:
+    new_settings = load_settings(selected_model=target_model)
+    storage.set_session_model_alias(session_id, new_settings.model_alias)
+    return _create_chat_model(new_settings), new_settings
+
+
+def _print_model_profiles_table(settings: Settings) -> None:
+    table = Table(title="Model Profiles")
+    table.add_column("No.", justify="right")
+    table.add_column("Alias")
+    table.add_column("Current", justify="center")
+    for index, alias in enumerate(settings.available_model_aliases, start=1):
+        table.add_row(
+            str(index),
+            _safe_console_text(alias),
+            "yes" if alias == settings.model_alias else "",
+        )
+    console.print(table)
+
+
+def _create_chat_model(settings: Settings) -> ChatModel:
+    return ChatModel(
         api_key=settings.api_key,
         model=settings.model,
         base_url=settings.base_url,
     )
-    storage = ChatStorage(settings.storage_path)
+
+
+def _build_storage() -> ChatStorage:
+    app_settings = load_app_settings()
+    storage = ChatStorage(app_settings.storage_path)
     storage.init()
+    return storage
+
+
+def _build_model(
+    selected_model: str | None = None,
+    session_id: str | None = None,
+    storage: ChatStorage | None = None,
+) -> tuple[ChatModel, ChatStorage, Settings]:
+    try:
+        storage = storage or _build_storage()
+        effective_model = selected_model
+        if session_id is not None and effective_model is None and storage.session_exists(session_id):
+            effective_model = storage.get_session_model_alias(session_id)
+        settings = load_settings(selected_model=effective_model)
+    except ValueError as exc:
+        console.print(f"[bold red]Config error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    model = _create_chat_model(settings)
     return model, storage, settings
 
 
@@ -56,10 +194,11 @@ def _chat_loop(
     settings: Settings,
     show_history: bool = False,
 ) -> None:
-    system_prompt = settings.system_prompt
+    system_prompt = normalize_text(settings.system_prompt)
     token_counter = TokenCounter(settings.model)
     session_config = storage.get_session_context_config(session_id)
     branch_commands_enabled = session_config.strategy == "branching"
+    memory_commands_enabled = session_config.strategy == "memory"
     message_records = storage.load_message_records(session_id)
     if not message_records:
         system_tokens = token_counter.count_text(system_prompt)
@@ -75,12 +214,14 @@ def _chat_loop(
     context_manager = ContextManager(storage=storage, token_counter=token_counter)
     debug_enabled = False
 
-    title = f"chat-agent | session #{session_id}"
+    title = f"chat-agent | session #{session_id} | model {_format_model_label(settings)}"
     if branch_commands_enabled:
         title += f" | branch {storage.get_active_branch_name(session_id) or 'main'}"
-    commands_line = "Commands: /exit, /clear, /debug, /stats, /summary, /compact"
+    commands_line = "Commands: /exit, /clear, /debug, /stats, /summary, /compact, /model"
     if branch_commands_enabled:
         commands_line += ", /checkpoint, /branch, /branches, /switch"
+    if memory_commands_enabled:
+        commands_line += ", /memory"
 
     console.print(
         Panel(
@@ -90,6 +231,7 @@ def _chat_loop(
             border_style="cyan",
         )
     )
+    _print_current_model(settings)
     if token_counter.fallback:
         console.print(
             "[dim yellow]"
@@ -127,6 +269,13 @@ def _chat_loop(
                 debug_enabled = not debug_enabled
                 state = "enabled" if debug_enabled else "disabled"
                 console.print(f"[yellow]Token debug {state}.[/yellow]")
+                if debug_enabled:
+                    _print_debug_snapshot(
+                        storage=storage,
+                        session_id=session_id,
+                        session_config=session_config,
+                        message_records=message_records,
+                    )
                 console.print()
                 continue
             if command == "/stats":
@@ -135,6 +284,54 @@ def _chat_loop(
                 continue
             if command == "/summary":
                 _print_session_summaries(storage.list_session_summaries(session_id))
+                console.print()
+                continue
+            if command == "/model":
+                target_model = user_text[len("/model"):].strip()
+                if not target_model:
+                    _print_model_selection(settings)
+                    chosen_model = _choose_model_interactive(settings)
+                    if chosen_model is None:
+                        console.print("[cyan]Model switch canceled.[/cyan]")
+                        console.print()
+                        continue
+                    target_model = chosen_model
+                elif target_model.lower() == "list":
+                    _print_model_selection(settings)
+                    console.print()
+                    continue
+                if target_model == settings.model_alias or target_model == settings.model:
+                    console.print("[yellow]Selected model is already active.[/yellow]")
+                    console.print()
+                    continue
+                try:
+                    model, new_settings = _switch_chat_model(
+                        session_id=session_id,
+                        storage=storage,
+                        target_model=target_model,
+                    )
+                except ValueError as exc:
+                    console.print(f"[bold red]Model switch failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                settings = new_settings
+                system_prompt = normalize_text(settings.system_prompt)
+                token_counter = TokenCounter(settings.model)
+                pricing = ModelPricing(
+                    input_per_1m=settings.input_cost_per_1m,
+                    output_per_1m=settings.output_cost_per_1m,
+                )
+                context_manager = ContextManager(storage=storage, token_counter=token_counter)
+                console.print(
+                    "[yellow]Model switched to "
+                    f"{_safe_console_text(_format_model_details(settings))}.[/yellow]"
+                )
+                if token_counter.fallback:
+                    console.print(
+                        "[dim yellow]"
+                        "tiktoken is not installed, token counts are approximate."
+                        "[/dim yellow]"
+                    )
                 console.print()
                 continue
             if command == "/compact":
@@ -154,6 +351,19 @@ def _chat_loop(
                 else:
                     console.print("[yellow]Nothing to compact yet.[/yellow]")
                 message_records = storage.load_message_records(session_id)
+                console.print()
+                continue
+            if command == "/memory":
+                if not memory_commands_enabled:
+                    console.print("[yellow]Memory layers are available only for context=memory.[/yellow]")
+                    console.print()
+                    continue
+                _print_memory_layers(
+                    storage=storage,
+                    session_id=session_id,
+                    message_records=message_records,
+                    window_messages=session_config.window_messages,
+                )
                 console.print()
                 continue
             if command == "/checkpoint":
@@ -230,12 +440,13 @@ def _chat_loop(
                 continue
             console.print(
                 "[yellow]Unknown command. Available commands: "
-                "/exit, /clear, /debug, /stats, /summary, /compact, "
-                "/checkpoint, /branch, /branches, /switch[/yellow]"
+                "/exit, /clear, /debug, /stats, /summary, /compact, /model, "
+                "/memory, /checkpoint, /branch, /branches, /switch[/yellow]"
             )
             console.print()
             continue
 
+        user_text = normalize_text(user_text)
         user_tokens = token_counter.count_text(user_text)
         storage.append_message(session_id, "user", user_text, token_count=user_tokens)
         message_records = storage.load_message_records(session_id)
@@ -289,7 +500,7 @@ def _chat_loop(
             message_records = storage.load_message_records(session_id)
             continue
 
-        assistant_text = reply.text
+        assistant_text = normalize_text(reply.text)
         assistant_tokens = token_counter.count_text(assistant_text)
         request_input_tokens = reply.usage.input_tokens if reply.usage else None
         request_output_tokens = reply.usage.output_tokens if reply.usage else None
@@ -319,6 +530,12 @@ def _chat_loop(
                     f"context compression: +{context.summarized_chunks} summary chunk(s)"
                     "[/dim]"
                 )
+            _print_debug_snapshot(
+                storage=storage,
+                session_id=session_id,
+                session_config=session_config,
+                message_records=message_records,
+            )
         console.print()
 
 
@@ -355,7 +572,7 @@ def _print_session_summaries(summaries: list[SessionSummaryRecord]) -> None:
         table.add_row(
             str(index),
             f"{summary.start_message_id}-{summary.end_message_id}",
-            summary.content,
+            _safe_console_text(summary.content),
         )
     console.print(table)
 
@@ -371,10 +588,76 @@ def _print_branches(branches: list[BranchRecord]) -> None:
     table.add_column("Active", justify="center")
     for branch in branches:
         table.add_row(
-            branch.name,
-            branch.parent_name or "-",
+            _safe_console_text(branch.name),
+            _safe_console_text(branch.parent_name or "-"),
             str(branch.fork_message_id) if branch.fork_message_id is not None else "-",
             "yes" if branch.is_active else "",
+        )
+    console.print(table)
+
+
+def _print_memory_layers(
+    storage: ChatStorage,
+    session_id: str,
+    message_records: list,
+    window_messages: int,
+) -> None:
+    short_term = [
+        row for row in message_records
+        if row.role != "system"
+    ][-max(1, window_messages):]
+    working = storage.list_working_memory(session_id)
+    long_term = storage.list_long_term_memory(session_id)
+
+    _print_memory_records(
+        title="Short-Term Memory",
+        records=[MemoryRecord(key=row.role, value=row.content) for row in short_term],
+    )
+    _print_memory_records(title="Working Memory", records=working)
+    _print_memory_records(title="Long-Term Memory", records=long_term)
+
+
+def _print_debug_snapshot(
+    storage: ChatStorage,
+    session_id: str,
+    session_config,
+    message_records: list,
+) -> None:
+    console.print(
+        f"[dim]debug snapshot: context={session_config.strategy} session={session_id}[/dim]"
+    )
+    if session_config.strategy == "memory":
+        _print_memory_layers(
+            storage=storage,
+            session_id=session_id,
+            message_records=message_records,
+            window_messages=session_config.window_messages,
+        )
+        return
+
+    short_term = [
+        row for row in message_records
+        if row.role != "system"
+    ][-max(1, session_config.window_messages):]
+    _print_memory_records(
+        title="Short-Term Memory",
+        records=[MemoryRecord(key=row.role, value=row.content) for row in short_term],
+    )
+    console.print("[dim]Working Memory: unavailable for this context strategy.[/dim]")
+    console.print("[dim]Long-Term Memory: unavailable for this context strategy.[/dim]")
+
+
+def _print_memory_records(title: str, records: list[MemoryRecord]) -> None:
+    if not records:
+        console.print(f"[yellow]{title}: empty.[/yellow]")
+        return
+    table = Table(title=title)
+    table.add_column("Key")
+    table.add_column("Value")
+    for item in records:
+        table.add_row(
+            _safe_console_text(item.key),
+            _safe_console_text(item.value),
         )
     console.print(table)
 
@@ -505,11 +788,11 @@ def _print_chat_history(messages: list[dict[str, str]]) -> None:
         role = message.get("role", "")
         content = message.get("content", "")
         if role == "user":
-            console.print(f"[bold green]You:[/bold green] {content}")
+            console.print(f"[bold green]You:[/bold green] {_safe_console_text(content)}")
         elif role == "assistant":
-            console.print(f"[bold blue]Assistant:[/bold blue] {content}")
+            console.print(f"[bold blue]Assistant:[/bold blue] {_safe_console_text(content)}")
         else:
-            console.print(f"[dim]System:[/dim] {content}")
+            console.print(f"[dim]System:[/dim] {_safe_console_text(content)}")
         console.print()
 
 
@@ -583,11 +866,16 @@ def _choose_session_interactive(sessions: list[SessionSummary]) -> str | None:
 
 @app.command()
 def chat(
+    model_name: str | None = typer.Option(
+        None,
+        "--model",
+        help="Model profile alias or raw model name.",
+    ),
     context_strategy: str = typer.Option(
         "full",
         "--contenxt",
         "--context",
-        help="Context strategy: full, sum, sliding, facts, branching",
+        help="Context strategy: full, sum, sliding, facts, branching, memory",
     ),
     summary_after_user_messages: int = typer.Option(
         10,
@@ -599,47 +887,66 @@ def chat(
         6,
         "--window-messages",
         min=1,
-        help="For context=sliding or facts: keep only the last N non-system messages.",
+        help="For context=sliding, facts, or memory: keep only the last N non-system messages.",
     ),
 ) -> None:
     """Start a new chat session."""
-    model, storage, settings = _build_model()
+    model, storage, settings = _build_model(selected_model=model_name)
     normalized_strategy = context_strategy.strip().lower()
-    if normalized_strategy not in {"full", "sum", "sliding", "facts", "branching"}:
+    if normalized_strategy not in {"full", "sum", "sliding", "facts", "branching", "memory"}:
         console.print(
             "[bold red]Invalid --context value. Use 'full', 'sum', 'sliding', "
-            "'facts', or 'branching'.[/bold red]"
+            "'facts', 'branching', or 'memory'.[/bold red]"
         )
         raise typer.Exit(code=1)
-    system_tokens = TokenCounter(settings.model).count_text(settings.system_prompt)
+    safe_system_prompt = normalize_text(settings.system_prompt)
+    system_tokens = TokenCounter(settings.model).count_text(safe_system_prompt)
     session_id = storage.create_session(
-        settings.system_prompt,
+        safe_system_prompt,
         token_count=system_tokens,
         context_strategy=normalized_strategy,
         summary_trigger_user_messages=summary_after_user_messages,
         context_window_messages=window_messages,
+        model_alias=settings.model_alias,
     )
     _chat_loop(model, storage, session_id, settings)
 
 
 @app.command()
-def resume(session_id: str | None = typer.Option(None, "--id", "-i")) -> None:
+def resume(
+    session_id: str | None = typer.Option(None, "--id", "-i"),
+    model_name: str | None = typer.Option(
+        None,
+        "--model",
+        help="Model profile alias or raw model name.",
+    ),
+) -> None:
     """Resume an existing chat session."""
-    model, storage, settings = _build_model()
+    storage = _build_storage()
     if session_id is not None:
         if not storage.session_exists(session_id):
             console.print(f"[bold red]Session #{session_id} not found.[/bold red]")
             raise typer.Exit(code=1)
+        model, storage, settings = _build_model(
+            selected_model=model_name,
+            session_id=session_id,
+            storage=storage,
+        )
+        if model_name is not None:
+            storage.set_session_model_alias(session_id, settings.model_alias)
         _chat_loop(model, storage, session_id, settings, show_history=True)
         return
 
     sessions = storage.list_sessions(limit=30)
     if not sessions:
         console.print("[yellow]No saved sessions found. Starting a new one.[/yellow]")
-        system_tokens = TokenCounter(settings.model).count_text(settings.system_prompt)
+        model, storage, settings = _build_model(selected_model=model_name, storage=storage)
+        safe_system_prompt = normalize_text(settings.system_prompt)
+        system_tokens = TokenCounter(settings.model).count_text(safe_system_prompt)
         session_id = storage.create_session(
-            settings.system_prompt,
+            safe_system_prompt,
             token_count=system_tokens,
+            model_alias=settings.model_alias,
         )
         _chat_loop(model, storage, session_id, settings)
         return
@@ -649,13 +956,20 @@ def resume(session_id: str | None = typer.Option(None, "--id", "-i")) -> None:
     if chosen_session_id is None:
         console.print("[cyan]Resume canceled.[/cyan]")
         return
+    model, storage, settings = _build_model(
+        selected_model=model_name,
+        session_id=chosen_session_id,
+        storage=storage,
+    )
+    if model_name is not None:
+        storage.set_session_model_alias(chosen_session_id, settings.model_alias)
     _chat_loop(model, storage, chosen_session_id, settings, show_history=True)
 
 
 @app.command()
 def sessions(limit: int = typer.Option(30, "--limit", "-n")) -> None:
     """Show saved sessions."""
-    _, storage, _settings = _build_model()
+    storage = _build_storage()
     saved = storage.list_sessions(limit=limit)
     if not saved:
         console.print("[yellow]No saved sessions.[/yellow]")

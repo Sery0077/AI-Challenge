@@ -17,6 +17,10 @@ def test_load_app_settings_uses_home_chat_agent_defaults(monkeypatch, tmp_path) 
 
     assert app_settings.storage_path == str(tmp_path / ".chat-agent" / "history.db")
     assert app_settings.user_profile_path == str(tmp_path / ".chat-agent" / "user_profile.json")
+    assert "терминальном чат-агенте" in app_settings.system_prompt
+    assert "Task flow:" in app_settings.system_prompt
+    assert "На стадии planning" in app_settings.system_prompt
+    assert "На стадии execution" in app_settings.system_prompt
 
 
 def test_load_settings_uses_model_profiles_from_toml(monkeypatch, tmp_path) -> None:

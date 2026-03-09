@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-chat-agent = "chat_agent_cli.cli:app"
+chat-agent = "chat_agent_cli.cli:main"
 
 [project.optional-dependencies]
 dev = [

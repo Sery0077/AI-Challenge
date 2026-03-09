@@ -344,3 +344,83 @@ def test_task_state_rejects_invalid_transition(tmp_path) -> None:
         assert "Invalid task stage transition" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("Expected invalid task stage transition to fail")
+
+
+def test_task_state_rejects_invalid_pending_transition(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+
+    try:
+        storage.set_task_state(
+            session_id,
+            stage="planning",
+            current_step="Clarify the task scope",
+            expected_action="Inspect relevant files",
+            pending_stage="done",
+            pending_current_step="Skip straight to the end",
+            pending_expected_action="No further action",
+            pending_confirmation_prompt="Finish immediately?",
+        )
+    except ValueError as exc:
+        assert "Invalid task stage transition" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected invalid pending task transition to fail")
+
+
+def test_replace_task_state_overwrites_active_task(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement old task",
+        expected_action="Ship old task",
+        is_paused=True,
+        pending_stage="validation",
+        pending_current_step="Run tests",
+        pending_expected_action="Ship old task",
+        pending_confirmation_prompt="Move to validation?",
+    )
+
+    replaced = storage.replace_task_state(
+        session_id,
+        stage="planning",
+        current_step="Start replacement task",
+        expected_action="Clarify requirements",
+    )
+    assert replaced.stage == "planning"
+    assert replaced.current_step == "Start replacement task"
+    assert replaced.expected_action == "Clarify requirements"
+    assert replaced.is_paused is False
+    assert replaced.awaiting_confirmation is False
+
+    stored = storage.get_task_state(session_id)
+    assert stored is not None
+    assert stored.stage == "planning"
+    assert stored.pending_stage is None
+
+
+def test_complete_task_forces_done_from_active_stage(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement feature",
+        expected_action="Run tests",
+    )
+
+    completed = storage.complete_task(session_id)
+    assert completed.stage == "done"
+    assert completed.current_step == "Implement feature"
+    assert completed.expected_action == "No further action"
+    assert completed.awaiting_confirmation is False

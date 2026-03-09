@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 
 import typer
@@ -15,6 +13,11 @@ from rich.table import Table
 from .config import Settings, load_app_settings, load_settings
 from .context import ContextManager
 from .llm import ChatModel
+from .pipeline import (
+    AgentTaskUpdate,
+    build_turn_messages,
+    parse_model_response,
+)
 from .storage import (
     BranchRecord,
     ChatStorage,
@@ -37,10 +40,6 @@ else:
 app = typer.Typer(help="Interactive CLI chat agent")
 console = Console()
 _TASK_STAGES = ("planning", "execution", "validation", "done")
-_TASK_PROTOCOL_RE = re.compile(
-    r"<<TASK_STATE>>\s*(?P<body>.*?)\s*<<END_TASK_STATE>>\s*$",
-    re.DOTALL,
-)
 _AFFIRMATIVE_CONFIRMATIONS = {
     "y",
     "yes",
@@ -65,15 +64,6 @@ _NEGATIVE_CONFIRMATIONS = {
     "отмена",
     "стоп",
 }
-
-
-@dataclass(slots=True)
-class AgentTaskUpdate:
-    stage: str
-    current_step: str
-    expected_action: str
-    transition: str
-    confirm_prompt: str | None = None
 
 
 class _TaskAwareStreamPrinter:
@@ -297,94 +287,6 @@ def _print_task_confirmation(task_state: TaskStateRecord) -> None:
     )
 
 
-def _build_task_protocol_message() -> dict[str, str]:
-    return {
-        "role": "system",
-        "content": (
-            "Task transition protocol:\n"
-            "Return exactly one metadata block at the end of every answer.\n"
-            "<<TASK_STATE>>\n"
-            "stage: planning|execution|validation|done\n"
-            "current_step: short sentence\n"
-            "expected_action: short sentence\n"
-            "transition: auto|confirm\n"
-            "confirm_prompt: short question when transition=confirm\n"
-            "<<END_TASK_STATE>>\n"
-            "Rules:\n"
-            "- Keep all user-visible text outside the metadata block.\n"
-            "- Use transition=auto when the task can continue without user approval.\n"
-            "- Use transition=confirm when you want explicit approval before applying a transition.\n"
-            "- If task state already exists, continue from it instead of restarting.\n"
-            "- If task state is missing, do not emit the metadata block."
-        ),
-    }
-
-
-def _inject_task_protocol(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    insert_at = 1 if messages and messages[0]["role"] == "system" else 0
-    result = list(messages)
-    result.insert(insert_at, _build_task_protocol_message())
-    return result
-
-
-def _merge_system_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    system_parts: list[str] = []
-    merged_messages: list[dict[str, str]] = []
-    for message in messages:
-        if message.get("role") == "system":
-            content = normalize_text(message.get("content", "")).strip()
-            if content:
-                system_parts.append(content)
-            continue
-        merged_messages.append(message)
-
-    if not system_parts:
-        return merged_messages
-    merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
-    return [merged_system, *merged_messages]
-
-
-def _extract_task_update(reply_text: str) -> tuple[str, AgentTaskUpdate | None]:
-    normalized_reply = normalize_text(reply_text).strip()
-    match = _TASK_PROTOCOL_RE.search(normalized_reply)
-    if match is None:
-        return normalized_reply, None
-
-    fields: dict[str, str] = {}
-    for raw_line in match.group("body").splitlines():
-        line = normalize_text(raw_line).strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        normalized_key = normalize_text(key).strip().lower()
-        normalized_value = normalize_text(value).strip()
-        if normalized_value:
-            fields[normalized_key] = normalized_value
-
-    visible_text = normalized_reply[:match.start()].strip()
-    stage = fields.get("stage")
-    current_step = fields.get("current_step")
-    expected_action = fields.get("expected_action")
-    transition = fields.get("transition", "").lower()
-    if stage is None or current_step is None or expected_action is None:
-        return visible_text, None
-    if transition not in {"auto", "confirm"}:
-        return visible_text, None
-    confirm_prompt = fields.get("confirm_prompt")
-    if transition == "confirm" and not confirm_prompt:
-        return visible_text, None
-    return (
-        visible_text,
-        AgentTaskUpdate(
-            stage=stage,
-            current_step=current_step,
-            expected_action=expected_action,
-            transition=transition,
-            confirm_prompt=confirm_prompt,
-        ),
-    )
-
-
 def _apply_agent_task_update(
     storage: ChatStorage,
     session_id: str,
@@ -392,6 +294,24 @@ def _apply_agent_task_update(
 ) -> TaskStateRecord | None:
     if task_update is None:
         return storage.get_task_state(session_id)
+    current_state = storage.get_task_state(session_id)
+    if task_update.stage == "done" and current_state is not None:
+        if current_state.stage == "execution":
+            return storage.complete_task(
+                session_id=session_id,
+                current_step=task_update.current_step,
+                expected_action=task_update.expected_action,
+            )
+        if (
+            current_state.stage == "planning"
+            and current_state.awaiting_confirmation
+            and current_state.pending_stage == "execution"
+        ):
+            return storage.complete_task(
+                session_id=session_id,
+                current_step=task_update.current_step,
+                expected_action=task_update.expected_action,
+            )
     if task_update.transition == "confirm":
         return storage.propose_task_state_transition(
             session_id=session_id,
@@ -415,6 +335,40 @@ def _match_confirmation_reply(user_text: str) -> str | None:
         return "approve"
     if normalized in _NEGATIVE_CONFIRMATIONS:
         return "reject"
+    contrast_markers = (" но ", " however ", " instead ", " сначала ", " сперва ")
+    if any(marker in f" {normalized} " for marker in contrast_markers):
+        return None
+
+    affirmative_prefixes = (
+        "да, давай",
+        "давай",
+        "ок, давай",
+        "окей, давай",
+        "хорошо, давай",
+        "поехали",
+        "можно приступать",
+        "приступай",
+        "запускай",
+        "go ahead",
+        "sounds good",
+        "looks good",
+        "lgtm",
+    )
+    for prefix in affirmative_prefixes:
+        if normalized == prefix or normalized.startswith(prefix + " "):
+            return "approve"
+
+    negative_prefixes = (
+        "нет, стоп",
+        "не надо",
+        "не запускай",
+        "отмена",
+        "cancel it",
+        "stop here",
+    )
+    for prefix in negative_prefixes:
+        if normalized == prefix or normalized.startswith(prefix + " "):
+            return "reject"
     return None
 
 
@@ -445,10 +399,7 @@ def _run_model_turn(
         session_id=session_id,
         message_records=message_records,
     )
-    messages = context.messages
-    if task_state is not None:
-        messages = _inject_task_protocol(messages)
-    messages = _merge_system_messages(messages)
+    messages = build_turn_messages(context.messages, task_state)
     estimated_prompt_tokens = token_counter.count_messages(messages)
     if estimated_prompt_tokens > settings.model_context_limit:
         console.print(
@@ -489,10 +440,9 @@ def _run_model_turn(
         console.print()
         return task_state, storage.load_message_records(session_id)
 
-    reply_text = normalize_text(reply.text)
-    assistant_text, task_update = _extract_task_update(reply_text)
-    if task_state is None:
-        task_update = None
+    parsed_reply = parse_model_response(reply.text, task_state)
+    assistant_text = parsed_reply.assistant_text
+    task_update = parsed_reply.task_update
     if not stream_printer.printed_anything and assistant_text:
         console.print(assistant_text, end="", markup=False, highlight=False)
     console.print()
@@ -609,7 +559,7 @@ def _chat_loop(
             title += " paused"
     commands_line = (
         "Commands: /exit, /clear, /debug, /stats, /summary, /compact, /model, "
-        "/pause, /continue"
+        "/task, /pause, /continue"
     )
     if branch_commands_enabled:
         commands_line += ", /checkpoint, /branch, /branches, /switch"
@@ -709,24 +659,26 @@ def _chat_loop(
                     console.print()
                     continue
                 if lowered_payload.startswith("next "):
+                    console.print(
+                        "[yellow]/task next is no longer supported. "
+                        "Use /task done or start a new task with /task <goal>.[/yellow]"
+                    )
+                    console.print()
+                    continue
+                if lowered_payload == "done":
                     try:
-                        current_step, expected_action = _parse_task_fields(payload[5:])
-                        task_state = storage.advance_task_state(
-                            session_id=session_id,
-                            current_step=current_step,
-                            expected_action=expected_action,
-                        )
+                        task_state = storage.complete_task(session_id=session_id)
                     except ValueError as exc:
-                        console.print(f"[bold red]Task transition failed:[/bold red] {exc}")
+                        console.print(f"[bold red]Task completion failed:[/bold red] {exc}")
                         console.print()
                         continue
-                    console.print("[yellow]Task advanced to next stage.[/yellow]")
+                    console.print("[yellow]Task completed.[/yellow]")
                     _print_task_state(task_state)
                     console.print()
                     continue
                 try:
                     stage, current_step, expected_action = _build_task_goal_state(payload)
-                    task_state = storage.set_task_state(
+                    task_state = storage.replace_task_state(
                         session_id=session_id,
                         stage=stage,
                         current_step=current_step,
@@ -736,7 +688,7 @@ def _chat_loop(
                     console.print(f"[bold red]Task update failed:[/bold red] {exc}")
                     console.print()
                     continue
-                console.print("[yellow]Task state updated.[/yellow]")
+                console.print("[yellow]Task started.[/yellow]")
                 _print_task_state(task_state)
                 console.print()
                 task_state, message_records = _run_model_turn(
@@ -946,7 +898,7 @@ def _chat_loop(
             console.print(
                 "[yellow]Unknown command. Available commands: "
                 "/exit, /clear, /debug, /stats, /summary, /compact, /model, "
-                "/pause, /continue, "
+                "/task, /pause, /continue, "
                 "/memory, /checkpoint, /branch, /branches, /switch[/yellow]"
             )
             console.print()
@@ -966,11 +918,6 @@ def _chat_loop(
                 _print_task_state(task_state)
                 console.print()
                 continue
-            else:
-                task_state = storage.reject_pending_task_transition(
-                    session_id,
-                    expected_action="Process the user's updated guidance",
-                )
 
         if task_state is not None and task_state.is_paused and not task_state.awaiting_confirmation:
             console.print(
@@ -987,10 +934,7 @@ def _chat_loop(
             session_id=session_id,
             message_records=message_records,
         )
-        messages = context.messages
-        if task_state is not None:
-            messages = _inject_task_protocol(messages)
-        messages = _merge_system_messages(messages)
+        messages = build_turn_messages(context.messages, task_state)
         estimated_prompt_tokens = token_counter.count_messages(messages)
         if estimated_prompt_tokens > settings.model_context_limit:
             console.print(
@@ -1033,10 +977,9 @@ def _chat_loop(
             message_records = storage.load_message_records(session_id)
             continue
 
-        reply_text = normalize_text(reply.text)
-        assistant_text, task_update = _extract_task_update(reply_text)
-        if task_state is None:
-            task_update = None
+        parsed_reply = parse_model_response(reply.text, task_state)
+        assistant_text = parsed_reply.assistant_text
+        task_update = parsed_reply.task_update
         if not stream_printer.printed_anything and assistant_text:
             console.print(assistant_text, end="", markup=False, highlight=False)
         console.print()
@@ -1565,6 +1508,8 @@ def token_demo() -> None:
 
 
 def main() -> None:
+    if len(sys.argv) == 1:
+        sys.argv.append("chat")
     app()
 
 

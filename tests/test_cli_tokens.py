@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from chat_agent_cli import cli
+from chat_agent_cli import pipeline
+from chat_agent_cli.pipeline import registry as pipeline_registry
 from chat_agent_cli.config import Settings
 from chat_agent_cli.context import ContextManager
 from chat_agent_cli.llm import ChatReply, ResponseUsage
@@ -160,6 +164,170 @@ class SystemMessageInspectingModel:
         return ChatReply(text="ack", usage=None)
 
 
+@dataclass
+class PlainTextPlanningModel:
+    def reply_stream(self, messages, on_delta):
+        last_user = next(
+            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+            "",
+        )
+        lowered = last_user.lower()
+        if "start working on the task from the current task state" in lowered:
+            answer = (
+                "Чтобы спланировать задачу, уточним пару моментов:\n"
+                "1. Где будет работать агент?\n"
+                "2. Нужно ли хранить состояние?\n"
+            )
+        elif "telegram" in lowered or "телеграм" in lowered:
+            answer = (
+                "Отлично, план для MVP готов:\n"
+                "1. Создать Telegram-бота на Python.\n"
+                "2. Обрабатывать все входящие сообщения.\n"
+                "3. Всегда отвечать текстом Pong.\n"
+                "Хочешь, я сразу перейду к реализации?"
+            )
+        elif "continue from the approved task state" in lowered:
+            answer = "Начинаю реализацию Telegram-бота с ответом Pong."
+        else:
+            answer = "ack"
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class RevisingPlanModel:
+    def reply_stream(self, messages, on_delta):
+        last_user = next(
+            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+            "",
+        )
+        lowered = last_user.lower()
+        if "start working on the task from the current task state" in lowered:
+            answer = "План готов: сделать Telegram-бота, который отвечает Pong. Хочешь, я сразу перейду к реализации?"
+        elif "добавь" in lowered or "логирование" in lowered:
+            answer = (
+                "Обновил план:\n"
+                "1. Добавить обработчик /start.\n"
+                "2. Отвечать Pong на любые сообщения.\n"
+                "3. Добавить простое логирование.\n"
+                "Хочешь, я перейду к реализации по этому плану?"
+            )
+        elif "continue from the approved task state" in lowered:
+            answer = "Начинаю реализацию по обновлённому плану."
+        else:
+            answer = "ack"
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class DoneTaskStateModel:
+    current_step: str = "Implementation verified by the user"
+    expected_action: str = "No further action"
+
+    def reply_stream(self, _messages, on_delta):
+        answer = (
+            "Рад, что всё работает.\n"
+            "<<TASK_STATE>>\n"
+            "stage: done\n"
+            f"current_step: {self.current_step}\n"
+            f"expected_action: {self.expected_action}\n"
+            "transition: auto\n"
+            "<<END_TASK_STATE>>"
+        )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class StructuredPlanningModel:
+    def reply_stream(self, messages, on_delta):
+        last_user = next(
+            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+            "",
+        )
+        lowered = last_user.lower()
+        if "start working on the task from the current task state" in lowered:
+            answer = (
+                "GOAL:\n"
+                "Сделать простого чат-агента.\n\n"
+                "UNDERSTANDING:\n"
+                "- Нужно собрать минимальный план реализации.\n"
+                "- Надо понять, хватает ли вводных.\n\n"
+                "CONSTRAINTS:\n"
+                "- none\n\n"
+                "ASSUMPTIONS:\n"
+                "- none\n\n"
+                "QUESTIONS:\n"
+                "- Какой интерфейс нужен агенту?\n\n"
+                "PLAN:\n"
+                "1. Уточнить интерфейс агента.\n"
+                "   RESULT: Понятен целевой сценарий использования.\n\n"
+                "DONE_CRITERIA:\n"
+                "- Есть согласованный план.\n\n"
+                "READINESS:\n"
+                "- NEEDS_CLARIFICATION"
+            )
+        else:
+            answer = (
+                "GOAL:\n"
+                "Сделать простого чат-агента для терминала.\n\n"
+                "UNDERSTANDING:\n"
+                "- Нужно сделать минимальную рабочую версию.\n"
+                "- Требуется перейти к реализации после подтверждения.\n\n"
+                "CONSTRAINTS:\n"
+                "- Без лишних зависимостей.\n\n"
+                "ASSUMPTIONS:\n"
+                "- Python уже выбран.\n\n"
+                "QUESTIONS:\n"
+                "- none\n\n"
+                "PLAN:\n"
+                "1. Добавить цикл чтения пользовательского ввода.\n"
+                "   RESULT: Агент принимает сообщения из терминала.\n"
+                "2. Подключить генерацию ответа модели.\n"
+                "   RESULT: Агент отвечает на каждое сообщение.\n"
+                "3. Проверить базовый сценарий общения.\n"
+                "   RESULT: Подтверждена работоспособность MVP.\n\n"
+                "DONE_CRITERIA:\n"
+                "- Агент отвечает в терминале.\n\n"
+                "READINESS:\n"
+                "- READY_FOR_EXECUTION\n\n"
+                "Можно переходить к выполнению?"
+            )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class StructuredExecutionModel:
+    def reply_stream(self, messages, on_delta):
+        answer = (
+            "PROGRESS:\n"
+            "- Реализация основных изменений завершена.\n\n"
+            "CHANGES:\n"
+            "- Обновлён task pipeline.\n\n"
+            "BLOCKERS:\n"
+            "- none\n\n"
+            "NEXT:\n"
+            "- Прогнать validation-сценарии.\n\n"
+            "VALIDATION_READINESS:\n"
+            "- READY_FOR_VALIDATION"
+        )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class PipelineInspectingModel:
+    seen_messages: list[dict[str, str]] | None = None
+
+    def reply_stream(self, messages, on_delta):
+        self.seen_messages = [dict(message) for message in messages]
+        answer = "SPECIAL_PLAN_TOKEN"
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
 def _settings(
     limit: int = 128000,
     model: str = "gpt-4.1-mini",
@@ -184,6 +352,27 @@ def test_safe_console_text_replaces_surrogates() -> None:
     sanitized = cli._safe_console_text("\udcd0broken")
     assert "\udcd0" not in sanitized
     assert "broken" in sanitized
+
+
+def test_main_defaults_to_chat_command(monkeypatch) -> None:
+    captured_argv: list[list[str]] = []
+
+    def _fake_app() -> None:
+        captured_argv.append(list(cli.sys.argv))
+
+    monkeypatch.setattr(cli, "app", _fake_app)
+    monkeypatch.setattr(cli.sys, "argv", ["chat-agent"])
+
+    cli.main()
+
+    assert captured_argv == [["chat-agent", "chat"]]
+
+
+def test_packaged_chat_agent_entrypoint_uses_main() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    config = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+
+    assert config["project"]["scripts"]["chat-agent"] == "chat_agent_cli.cli:main"
 
 
 def test_chat_loop_debug_and_stats(monkeypatch, tmp_path) -> None:
@@ -272,6 +461,68 @@ def test_chat_loop_merges_system_messages_before_model_request(monkeypatch, tmp_
     assert len(system_messages) == 1
     assert "You are test assistant." in system_messages[0]["content"]
     assert "User profile:" in system_messages[0]["content"]
+
+
+def test_chat_loop_injects_planning_stage_prompt(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify scope",
+        expected_action="Prepare a short plan",
+    )
+    model = SystemMessageInspectingModel()
+
+    fake_console = FakeConsole(inputs=["hello", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    assert model.seen_messages is not None
+    system_messages = [message for message in model.seen_messages if message["role"] == "system"]
+    assert len(system_messages) == 1
+    assert "Ты находишься на стадии PLAN в агенте со стейт-машиной:" in system_messages[0]["content"]
+    assert "Не используй жёсткий шаблон с заголовками вроде GOAL" in system_messages[0]["content"]
+    assert "Task transition protocol:" in system_messages[0]["content"]
+
+
+def test_chat_loop_injects_execution_stage_prompt(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement feature",
+        expected_action="Report progress",
+    )
+    model = SystemMessageInspectingModel()
+
+    fake_console = FakeConsole(inputs=["hello", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    assert model.seen_messages is not None
+    system_messages = [message for message in model.seen_messages if message["role"] == "system"]
+    assert len(system_messages) == 1
+    assert "Ты находишься на стадии EXECUTION в агенте со стейт-машиной:" in system_messages[0]["content"]
+    assert "Не используй жёсткий шаблон с заголовками вроде PROGRESS" in system_messages[0]["content"]
+    assert "Task transition protocol:" in system_messages[0]["content"]
 
 
 def test_chat_loop_summary_command(monkeypatch, tmp_path) -> None:
@@ -586,7 +837,7 @@ def test_chat_loop_task_state_survives_pause_and_restart(monkeypatch, tmp_path) 
             "We need a formal task state with planning, execution, validation, and done.",
             "Capture another implementation detail.",
             "One more note that should push old context out of the sliding window.",
-            "/task next Implement task state storage | Inject task state into prompt context",
+            "/task set execution Implement task state storage | Inject task state into prompt context",
             "/pause Wait for resume",
             "/exit",
         ]
@@ -606,7 +857,6 @@ def test_chat_loop_task_state_survives_pause_and_restart(monkeypatch, tmp_path) 
     assert paused_state.stage == "execution"
     assert paused_state.is_paused is True
     assert any("Task state updated." in line for line in first_console.print_calls)
-    assert any("Task advanced to next stage." in line for line in first_console.print_calls)
     assert any("Task paused." in line for line in first_console.print_calls)
 
     manager = ContextManager(storage=storage, token_counter=FakeTokenCounter("gpt-4.1-mini"))
@@ -679,9 +929,428 @@ def test_task_command_initializes_planning_state_from_goal_and_bootstraps_model(
     assert task_state.awaiting_confirmation is True
     assert task_state.current_step == "Fix LM Studio compatibility"
     assert task_state.expected_action == "Clarify requirements and define the next concrete step"
-    assert any("Task state updated." in line for line in fake_console.print_calls)
+    assert any("Task started." in line for line in fake_console.print_calls)
     assert any("I have the plan and need approval before execution." in line for line in fake_console.print_calls)
     assert any("Awaiting confirmation:" in line for line in fake_console.print_calls)
+
+
+def test_task_command_transitions_from_planning_to_execution_with_plain_text_flow(
+    monkeypatch, tmp_path
+) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+
+    fake_console = FakeConsole(
+        inputs=[
+            "/task сделай простого чат-агента",
+            "хочу телеграм бота, который всегда отвечает pong",
+            "yes",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=PlainTextPlanningModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "execution"
+    assert task_state.is_paused is False
+    assert task_state.awaiting_confirmation is False
+    printed_output = "".join(fake_console.print_calls)
+    assert "Answer the open planning questions" in printed_output
+    assert "Awaiting confirmation:" in printed_output
+    assert "Task transition confirmed." in printed_output
+    assert "Stage: execution" in printed_output
+
+
+def test_task_confirmation_accepts_human_friendly_approval_phrase(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+
+    fake_console = FakeConsole(
+        inputs=[
+            "/task сделай простого чат-агента",
+            "хочу телеграм бота, который всегда отвечает pong",
+            "да, давай приступай",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=PlainTextPlanningModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "execution"
+    assert task_state.awaiting_confirmation is False
+    printed_output = "".join(fake_console.print_calls)
+    assert "Task transition confirmed." in printed_output
+    assert "Начинаю реализацию Telegram-бота с ответом Pong." in printed_output
+
+
+def test_task_planning_structured_readiness_drives_transition(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+
+    fake_console = FakeConsole(
+        inputs=[
+            "/task сделай простого чат-агента",
+            "нужен терминальный интерфейс",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=StructuredPlanningModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "planning"
+    assert task_state.awaiting_confirmation is True
+    assert task_state.pending_stage == "execution"
+    printed_output = "".join(fake_console.print_calls)
+    assert "READINESS:" in printed_output
+    assert "Awaiting confirmation:" in printed_output
+
+
+def test_task_pipeline_supports_phase_specific_builders_and_validators(
+    monkeypatch, tmp_path
+) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    model = PipelineInspectingModel()
+
+    class PlanningOnlySystemBuilder:
+        def supports_phase(self, phase: str) -> bool:
+            return phase == "planning"
+
+        def build_messages(self, context) -> list[dict[str, str]]:
+            assert context.phase == "planning"
+            return [{"role": "system", "content": "Planning invariant: keep the plan minimal."}]
+
+    class PlanningOnlyValidator:
+        def supports_phase(self, phase: str) -> bool:
+            return phase == "planning"
+
+        def validate(self, context, result):
+            assert context.phase == "planning"
+            if result.assistant_text != "SPECIAL_PLAN_TOKEN":
+                return result
+            return pipeline.ResponseParseResult(
+                raw_reply_text=result.raw_reply_text,
+                assistant_text="План готов. Нужен апрув перед началом реализации.",
+                task_update=pipeline.AgentTaskUpdate(
+                    stage="execution",
+                    current_step="Implement the approved plan",
+                    expected_action="Execute the approved plan and report progress",
+                    transition="confirm",
+                    confirm_prompt="Перейти к реализации по этому плану?",
+                ),
+            )
+
+    monkeypatch.setattr(cli, "console", FakeConsole(inputs=["/task Собери pipeline", "/exit"]))
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+    monkeypatch.setattr(
+        pipeline,
+        "SYSTEM_PROMPT_BUILDERS",
+        [PlanningOnlySystemBuilder()],
+    )
+    monkeypatch.setattr(
+        pipeline_registry,
+        "SYSTEM_PROMPT_BUILDERS",
+        [PlanningOnlySystemBuilder()],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "PROMPT_BUILDERS",
+        [pipeline.MergeSystemMessagesBuilder()],
+    )
+    monkeypatch.setattr(
+        pipeline_registry,
+        "PROMPT_BUILDERS",
+        [pipeline.MergeSystemMessagesBuilder()],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "RESPONSE_VALIDATORS",
+        [PlanningOnlyValidator()],
+    )
+    monkeypatch.setattr(
+        pipeline_registry,
+        "RESPONSE_VALIDATORS",
+        [PlanningOnlyValidator()],
+    )
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "planning"
+    assert task_state.awaiting_confirmation is True
+    assert task_state.pending_stage == "execution"
+    assert model.seen_messages is not None
+    system_messages = [message for message in model.seen_messages if message["role"] == "system"]
+    assert len(system_messages) == 1
+    assert "Planning invariant: keep the plan minimal." in system_messages[0]["content"]
+    assert "Task transition protocol:" not in system_messages[0]["content"]
+
+
+def test_task_execution_structured_readiness_moves_to_validation(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement the task pipeline",
+        expected_action="Finish the current implementation step",
+    )
+
+    fake_console = FakeConsole(inputs=["продолжай", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=StructuredExecutionModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "validation"
+    assert task_state.current_step == "Реализация основных изменений завершена."
+    assert task_state.expected_action == "Прогнать validation-сценарии."
+    printed_output = "".join(fake_console.print_calls)
+    assert "VALIDATION_READINESS:" in printed_output
+    assert "Stage: validation" in printed_output
+
+
+def test_task_confirmation_accepts_freeform_plan_changes(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+
+    fake_console = FakeConsole(
+        inputs=[
+            "/task сделай простого чат-агента",
+            "да, но добавь /start и логирование",
+            "ок, давай",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=RevisingPlanModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "execution"
+    assert task_state.awaiting_confirmation is False
+    printed_output = "".join(fake_console.print_calls)
+    assert "Task transition confirmed." in printed_output
+    assert "Обновил план:" in printed_output
+    assert "Task transition canceled." not in printed_output
+    assert "Начинаю реализацию по обновлённому плану." in printed_output
+
+
+def test_task_command_replaces_active_task_with_new_goal(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement the old task",
+        expected_action="Ship the old task",
+    )
+
+    fake_console = FakeConsole(inputs=["/task Start the replacement task", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=ConfirmingTaskStateModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "planning"
+    assert task_state.current_step == "Start the replacement task"
+    assert task_state.awaiting_confirmation is True
+    assert any("Task started." in line for line in fake_console.print_calls)
+
+
+def test_task_done_completes_active_task(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement task state storage",
+        expected_action="Run targeted tests",
+    )
+
+    fake_console = FakeConsole(inputs=["/task done", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=FakeModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "done"
+    assert task_state.current_step == "Implement task state storage"
+    assert task_state.expected_action == "No further action"
+    assert any("Task completed." in line for line in fake_console.print_calls)
+
+
+def test_user_completion_reply_finishes_execution_task_via_model_done_transition(
+    monkeypatch, tmp_path
+) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement Telegram bot",
+        expected_action="Wait for user confirmation after manual check",
+    )
+
+    fake_console = FakeConsole(inputs=["всё работает, спасибо", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=DoneTaskStateModel(
+            current_step="Implement Telegram bot",
+            expected_action="No further action",
+        ),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "done"
+    assert task_state.current_step == "Implement Telegram bot"
+    assert task_state.expected_action == "No further action"
+    assert any("Рад, что всё работает." in line for line in fake_console.print_calls)
+    assert any("Task state synced." in line for line in fake_console.print_calls)
+
+
+def test_model_can_complete_task_from_pending_execution_confirmation(
+    monkeypatch, tmp_path
+) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="напиши просто эхо бота для телеграм на питоне",
+        expected_action="Process the user's updated guidance",
+        is_paused=True,
+        pending_stage="execution",
+        pending_current_step="Написан код эхо-бота на Python с использованием python-telegram-bot.",
+        pending_expected_action="Confirm the bot works as expected or assist with setup.",
+        pending_confirmation_prompt="Код готов. Ты хочешь, чтобы я помог с запуском?",
+    )
+
+    fake_console = FakeConsole(inputs=["всё работает, спасибо", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=DoneTaskStateModel(
+            current_step="Написан и проверен рабочий эхо-бот для Telegram",
+            expected_action="No further action",
+        ),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "done"
+    assert task_state.current_step == "Написан и проверен рабочий эхо-бот для Telegram"
+    assert task_state.expected_action == "No further action"
+    assert task_state.is_paused is False
+    assert task_state.awaiting_confirmation is False
+    assert any("Рад, что всё работает." in line for line in fake_console.print_calls)
+    assert any("Stage: done" in line for line in fake_console.print_calls)
 
 
 def test_chat_loop_paused_task_requires_continue(monkeypatch, tmp_path) -> None:

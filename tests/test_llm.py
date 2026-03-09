@@ -45,7 +45,10 @@ class _FakeResponsesApi:
 
 
 class _FakeOpenAI:
-    def __init__(self, *_args, **_kwargs) -> None:
+    last_kwargs: dict[str, object] | None = None
+
+    def __init__(self, *_args, **kwargs) -> None:
+        _FakeOpenAI.last_kwargs = dict(kwargs)
         self.responses = _FakeResponsesApi()
 
 
@@ -69,6 +72,11 @@ def test_chat_model_uses_responses_api_for_localhost_reply(monkeypatch) -> None:
     assert reply.usage is not None
     assert reply.usage.input_tokens == 7
     assert reply.usage.output_tokens == 3
+    timeout = _FakeOpenAI.last_kwargs["timeout"]
+    assert timeout.connect == 300.0
+    assert timeout.write == 300.0
+    assert timeout.pool == 300.0
+    assert timeout.read == 300.0
 
 
 def test_chat_model_uses_responses_api_for_localhost_stream(monkeypatch) -> None:

@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import httpx
 from openai import OpenAI
+
+_DEFAULT_CONNECT_TIMEOUT_SECONDS = 300.0
+_DEFAULT_WRITE_TIMEOUT_SECONDS = 300.0
+_DEFAULT_POOL_TIMEOUT_SECONDS = 300.0
+_DEFAULT_READ_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(slots=True)
@@ -21,7 +27,16 @@ class ChatReply:
 
 class ChatModel:
     def __init__(self, api_key: str, model: str, base_url: str | None = None) -> None:
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(
+                connect=_DEFAULT_CONNECT_TIMEOUT_SECONDS,
+                write=_DEFAULT_WRITE_TIMEOUT_SECONDS,
+                pool=_DEFAULT_POOL_TIMEOUT_SECONDS,
+                read=_DEFAULT_READ_TIMEOUT_SECONDS,
+            ),
+        )
         self._model = model
 
     def reply(self, messages: list[dict[str, str]]) -> ChatReply:

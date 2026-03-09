@@ -20,6 +20,13 @@ _NEXT_TASK_STAGE = {
     "execution": "validation",
     "validation": "done",
 }
+_ALLOWED_TASK_STAGE_TRANSITIONS = {
+    None: frozenset(_TASK_STAGES),
+    "planning": frozenset({"planning", "execution"}),
+    "execution": frozenset({"execution", "validation"}),
+    "validation": frozenset({"validation", "done"}),
+    "done": frozenset({"done", "planning"}),
+}
 
 
 def _normalize_task_stage(stage: str) -> str:
@@ -670,12 +677,6 @@ class ChatStorage:
             if pending_confirmation_prompt is not None
             else None
         )
-        self._validate_pending_task_state(
-            pending_stage=normalized_pending_stage,
-            pending_current_step=normalized_pending_step,
-            pending_expected_action=normalized_pending_action,
-            pending_confirmation_prompt=normalized_pending_prompt,
-        )
         now = _now_iso()
 
         with sqlite3.connect(self._path) as conn:
@@ -684,6 +685,13 @@ class ChatStorage:
             self._validate_task_transition(
                 current_stage=current_state.stage if current_state is not None else None,
                 new_stage=normalized_stage,
+            )
+            self._validate_pending_task_state(
+                current_stage=normalized_stage,
+                pending_stage=normalized_pending_stage,
+                pending_current_step=normalized_pending_step,
+                pending_expected_action=normalized_pending_action,
+                pending_confirmation_prompt=normalized_pending_prompt,
             )
             paused_value = (
                 current_state.is_paused if current_state is not None and is_paused is None else bool(is_paused)
@@ -764,6 +772,87 @@ class ChatStorage:
             pending_confirmation_prompt=None,
         )
 
+    def replace_task_state(
+        self,
+        session_id: str,
+        stage: str,
+        current_step: str,
+        expected_action: str,
+    ) -> TaskStateRecord:
+        normalized_stage = _normalize_task_stage(stage)
+        normalized_step = _normalize_task_field("current step", current_step)
+        normalized_action = _normalize_task_field("expected action", expected_action)
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=normalized_stage,
+                current_step=normalized_step,
+                expected_action=normalized_action,
+                is_paused=False,
+                pending_stage=None,
+                pending_current_step=None,
+                pending_expected_action=None,
+                pending_confirmation_prompt=None,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=normalized_stage,
+            current_step=normalized_step,
+            expected_action=normalized_action,
+            is_paused=False,
+        )
+
+    def complete_task(
+        self,
+        session_id: str,
+        current_step: str | None = None,
+        expected_action: str = "No further action",
+    ) -> TaskStateRecord:
+        normalized_action = _normalize_task_field("expected action", expected_action)
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            next_step = current_state.current_step
+            if current_step is not None:
+                next_step = _normalize_task_field("current step", current_step)
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage="done",
+                current_step=next_step,
+                expected_action=normalized_action,
+                is_paused=False,
+                pending_stage=None,
+                pending_current_step=None,
+                pending_expected_action=None,
+                pending_confirmation_prompt=None,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage="done",
+            current_step=next_step,
+            expected_action=normalized_action,
+            is_paused=False,
+        )
+
     def propose_task_state_transition(
         self,
         session_id: str,
@@ -826,6 +915,10 @@ class ChatStorage:
             current_state = self._require_task_state(conn, db_session_id)
             if not current_state.awaiting_confirmation:
                 raise ValueError("Task transition is not awaiting confirmation")
+            self._validate_task_transition(
+                current_stage=current_state.stage,
+                new_stage=current_state.pending_stage,
+            )
             self._upsert_task_state(
                 conn=conn,
                 db_session_id=db_session_id,
@@ -1569,12 +1662,8 @@ class ChatStorage:
         current_stage: str | None,
         new_stage: str,
     ) -> None:
-        if current_stage is None or current_stage == new_stage:
-            return
-        if current_stage == "done" and new_stage == "planning":
-            return
-        next_stage = _NEXT_TASK_STAGE.get(current_stage)
-        if next_stage != new_stage:
+        allowed_transitions = _ALLOWED_TASK_STAGE_TRANSITIONS.get(current_stage)
+        if allowed_transitions is None or new_stage not in allowed_transitions:
             raise ValueError(
                 f"Invalid task stage transition: {current_stage} -> {new_stage}"
             )
@@ -1659,6 +1748,7 @@ class ChatStorage:
 
     @staticmethod
     def _validate_pending_task_state(
+        current_stage: str,
         pending_stage: str | None,
         pending_current_step: str | None,
         pending_expected_action: str | None,
@@ -1674,6 +1764,10 @@ class ChatStorage:
             return
         if any(value is None for value in values):
             raise ValueError("Pending task transition must include all fields")
+        ChatStorage._validate_task_transition(
+            current_stage=current_stage,
+            new_stage=pending_stage,
+        )
 
     def _load_branching_message_records(
         self,

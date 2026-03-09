@@ -99,6 +99,12 @@ def test_storage_sanitizes_surrogates_before_sqlite_write(tmp_path) -> None:
         session_id,
         [("pref\udcd3erence", "Wind\udcd4ow seat")],
     )
+    storage.set_task_state(
+        session_id,
+        "planning",
+        "Collect \udcd6requirements",
+        "Prepare \udcd1implementation plan",
+    )
     storage.clear_session(
         session_id,
         "Reset \udcd5prompt",
@@ -154,6 +160,18 @@ def test_storage_sanitizes_surrogates_before_sqlite_write(tmp_path) -> None:
     _assert_no_surrogates(long_term.key)
     _assert_no_surrogates(long_term.value)
 
+    task_session_id = storage.create_session("System prompt", token_count=3)
+    storage.set_task_state(
+        task_session_id,
+        "execution",
+        "Implement \udcd2task state",
+        "Run \udcd3targeted tests",
+    )
+    task_state = storage.get_task_state(task_session_id)
+    assert task_state is not None
+    _assert_no_surrogates(task_state.current_step)
+    _assert_no_surrogates(task_state.expected_action)
+
 
 def test_storage_sanitizes_branching_write_paths(tmp_path) -> None:
     db_path = tmp_path / "history.db"
@@ -180,3 +198,149 @@ def test_storage_sanitizes_branching_write_paths(tmp_path) -> None:
     saved_branches = storage.list_branches(session_id)
     assert any(saved.name == "opt?ion-a" for saved in saved_branches)
     _assert_no_surrogates(saved_checkpoint.name)
+
+
+def test_task_state_roundtrip_and_pause_flow(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+
+    planning = storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Inspect relevant files",
+    )
+    assert planning.stage == "planning"
+    assert planning.is_paused is False
+
+    paused_planning = storage.pause_task(session_id, "Wait for resume")
+    assert paused_planning.stage == "planning"
+    assert paused_planning.is_paused is True
+
+    resumed_planning = storage.resume_task(session_id, "Start implementation")
+    assert resumed_planning.is_paused is False
+    assert resumed_planning.expected_action == "Start implementation"
+
+    execution = storage.advance_task_state(
+        session_id,
+        current_step="Implement storage for task state",
+        expected_action="Wire task state into prompt context",
+    )
+    assert execution.stage == "execution"
+    assert execution.is_paused is False
+
+    paused_execution = storage.pause_task(session_id)
+    assert paused_execution.stage == "execution"
+    assert paused_execution.is_paused is True
+
+    resumed_execution = storage.resume_task(session_id, "Validate pause and resume")
+    assert resumed_execution.stage == "execution"
+    assert resumed_execution.is_paused is False
+
+    validation = storage.advance_task_state(
+        session_id,
+        current_step="Run targeted tests",
+        expected_action="Confirm resume works without repeated context",
+    )
+    assert validation.stage == "validation"
+
+    paused_validation = storage.pause_task(session_id)
+    assert paused_validation.stage == "validation"
+    assert paused_validation.is_paused is True
+
+    done = storage.advance_task_state(
+        session_id,
+        current_step="Ship the change",
+        expected_action="No further action",
+    )
+    assert done.stage == "done"
+    assert done.is_paused is False
+
+    stored = storage.get_task_state(session_id)
+    assert stored is not None
+    assert stored.stage == "done"
+    assert stored.current_step == "Ship the change"
+    assert stored.expected_action == "No further action"
+    assert stored.awaiting_confirmation is False
+
+
+def test_task_state_pending_transition_roundtrip(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Prepare the first execution step",
+    )
+
+    proposed = storage.propose_task_state_transition(
+        session_id,
+        stage="execution",
+        current_step="Implement automatic task transitions",
+        expected_action="Validate the resumed flow",
+        confirmation_prompt="Move the task to execution?",
+    )
+    assert proposed.stage == "planning"
+    assert proposed.is_paused is True
+    assert proposed.awaiting_confirmation is True
+    assert proposed.pending_stage == "execution"
+
+    stored = storage.get_task_state(session_id)
+    assert stored is not None
+    assert stored.pending_current_step == "Implement automatic task transitions"
+    assert stored.pending_expected_action == "Validate the resumed flow"
+    assert stored.pending_confirmation_prompt == "Move the task to execution?"
+
+    approved = storage.approve_pending_task_transition(session_id)
+    assert approved.stage == "execution"
+    assert approved.current_step == "Implement automatic task transitions"
+    assert approved.expected_action == "Validate the resumed flow"
+    assert approved.awaiting_confirmation is False
+
+    storage.propose_task_state_transition(
+        session_id,
+        stage="validation",
+        current_step="Run targeted tests",
+        expected_action="Ship the change",
+        confirmation_prompt="Move the task to validation?",
+    )
+    rejected = storage.reject_pending_task_transition(
+        session_id,
+        expected_action="Revise execution after rejection",
+    )
+    assert rejected.stage == "execution"
+    assert rejected.expected_action == "Revise execution after rejection"
+    assert rejected.awaiting_confirmation is False
+
+
+def test_task_state_rejects_invalid_transition(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Inspect relevant files",
+    )
+
+    try:
+        storage.set_task_state(
+            session_id,
+            stage="validation",
+            current_step="Skip execution",
+            expected_action="This should fail",
+        )
+    except ValueError as exc:
+        assert "Invalid task stage transition" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected invalid task stage transition to fail")

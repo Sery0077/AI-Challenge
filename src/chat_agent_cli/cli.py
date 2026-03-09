@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 
 import typer
@@ -19,6 +21,7 @@ from .storage import (
     MemoryRecord,
     SessionSummary,
     SessionSummaryRecord,
+    TaskStateRecord,
     SessionTokenStats,
 )
 from .text import normalize_text
@@ -33,6 +36,87 @@ else:
 
 app = typer.Typer(help="Interactive CLI chat agent")
 console = Console()
+_TASK_STAGES = ("planning", "execution", "validation", "done")
+_TASK_PROTOCOL_RE = re.compile(
+    r"<<TASK_STATE>>\s*(?P<body>.*?)\s*<<END_TASK_STATE>>\s*$",
+    re.DOTALL,
+)
+_AFFIRMATIVE_CONFIRMATIONS = {
+    "y",
+    "yes",
+    "ok",
+    "okay",
+    "confirm",
+    "continue",
+    "да",
+    "ага",
+    "ок",
+    "подтверждаю",
+    "продолжай",
+    "продолжить",
+}
+_NEGATIVE_CONFIRMATIONS = {
+    "n",
+    "no",
+    "cancel",
+    "stop",
+    "нет",
+    "не",
+    "отмена",
+    "стоп",
+}
+
+
+@dataclass(slots=True)
+class AgentTaskUpdate:
+    stage: str
+    current_step: str
+    expected_action: str
+    transition: str
+    confirm_prompt: str | None = None
+
+
+class _TaskAwareStreamPrinter:
+    def __init__(self) -> None:
+        self._marker = "<<TASK_STATE>>"
+        self._marker_len = len(self._marker)
+        self._buffer = ""
+        self._seen_marker = False
+        self._printed_anything = False
+
+    @property
+    def printed_anything(self) -> bool:
+        return self._printed_anything
+
+    def push(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if self._seen_marker:
+            return
+        self._buffer += chunk
+        marker_index = self._buffer.find(self._marker)
+        if marker_index >= 0:
+            self._print_visible(self._buffer[:marker_index])
+            self._buffer = ""
+            self._seen_marker = True
+            return
+        safe_cutoff = len(self._buffer) - (self._marker_len - 1)
+        if safe_cutoff > 0:
+            self._print_visible(self._buffer[:safe_cutoff])
+            self._buffer = self._buffer[safe_cutoff:]
+
+    def finish(self) -> None:
+        if self._seen_marker:
+            self._buffer = ""
+            return
+        self._print_visible(self._buffer)
+        self._buffer = ""
+
+    def _print_visible(self, text: str) -> None:
+        if not text:
+            return
+        console.print(text, end="", markup=False, highlight=False)
+        self._printed_anything = True
 
 def _safe_console_text(value: object) -> str:
     return normalize_text(str(value))
@@ -140,6 +224,300 @@ def _switch_chat_model(
     return _create_chat_model(new_settings), new_settings
 
 
+def _parse_task_fields(payload: str) -> tuple[str, str]:
+    current_step, separator, expected_action = payload.partition("|")
+    if not separator:
+        raise ValueError("Use <current-step> | <expected-action>")
+    normalized_step = normalize_text(current_step).strip()
+    normalized_action = normalize_text(expected_action).strip()
+    if not normalized_step or not normalized_action:
+        raise ValueError("Current step and expected action cannot be empty")
+    return normalized_step, normalized_action
+
+
+def _parse_task_set_command(payload: str) -> tuple[str, str, str]:
+    stage, separator, remainder = payload.strip().partition(" ")
+    if not separator:
+        raise ValueError("Use /task set <stage> <current-step> | <expected-action>")
+    normalized_stage = normalize_text(stage).strip().lower()
+    if normalized_stage not in _TASK_STAGES:
+        raise ValueError("Stage must be one of: " + ", ".join(_TASK_STAGES))
+    current_step, expected_action = _parse_task_fields(remainder)
+    return normalized_stage, current_step, expected_action
+
+
+def _build_task_goal_state(goal: str) -> tuple[str, str, str]:
+    normalized_goal = normalize_text(goal).strip()
+    if not normalized_goal:
+        raise ValueError("Task goal cannot be empty")
+    return (
+        "planning",
+        normalized_goal,
+        "Clarify requirements and define the next concrete step",
+    )
+
+
+def _format_task_state(task_state: TaskStateRecord) -> str:
+    status = "paused" if task_state.is_paused else "active"
+    lines = [
+        f"Stage: {task_state.stage}",
+        f"Status: {status}",
+        f"Current: {task_state.current_step}",
+        f"Next: {task_state.expected_action}",
+    ]
+    if task_state.awaiting_confirmation:
+        lines.extend(
+            [
+                "Pending transition:",
+                f"  Stage: {task_state.pending_stage}",
+                f"  Current: {task_state.pending_current_step}",
+                f"  Next: {task_state.pending_expected_action}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _print_task_state(task_state: TaskStateRecord | None) -> None:
+    if task_state is None:
+        console.print(
+            "[yellow]Task state is not set yet. Use /task <goal> to initialize it.[/yellow]"
+        )
+        return
+    console.print(f"[cyan]Task state:[/cyan] {_safe_console_text(_format_task_state(task_state))}")
+
+
+def _print_task_confirmation(task_state: TaskStateRecord) -> None:
+    if not task_state.awaiting_confirmation:
+        return
+    prompt = task_state.pending_confirmation_prompt or "Approve the proposed task transition?"
+    console.print(
+        "[yellow]Awaiting confirmation:[/yellow] "
+        f"{_safe_console_text(prompt)} "
+        "[dim](reply yes/no or send updated guidance)[/dim]"
+    )
+
+
+def _build_task_protocol_message() -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "Task transition protocol:\n"
+            "Return exactly one metadata block at the end of every answer.\n"
+            "<<TASK_STATE>>\n"
+            "stage: planning|execution|validation|done\n"
+            "current_step: short sentence\n"
+            "expected_action: short sentence\n"
+            "transition: auto|confirm\n"
+            "confirm_prompt: short question when transition=confirm\n"
+            "<<END_TASK_STATE>>\n"
+            "Rules:\n"
+            "- Keep all user-visible text outside the metadata block.\n"
+            "- Use transition=auto when the task can continue without user approval.\n"
+            "- Use transition=confirm when you want explicit approval before applying a transition.\n"
+            "- If task state already exists, continue from it instead of restarting.\n"
+            "- If task state is missing, do not emit the metadata block."
+        ),
+    }
+
+
+def _inject_task_protocol(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    insert_at = 1 if messages and messages[0]["role"] == "system" else 0
+    result = list(messages)
+    result.insert(insert_at, _build_task_protocol_message())
+    return result
+
+
+def _merge_system_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    system_parts: list[str] = []
+    merged_messages: list[dict[str, str]] = []
+    for message in messages:
+        if message.get("role") == "system":
+            content = normalize_text(message.get("content", "")).strip()
+            if content:
+                system_parts.append(content)
+            continue
+        merged_messages.append(message)
+
+    if not system_parts:
+        return merged_messages
+    merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+    return [merged_system, *merged_messages]
+
+
+def _extract_task_update(reply_text: str) -> tuple[str, AgentTaskUpdate | None]:
+    normalized_reply = normalize_text(reply_text).strip()
+    match = _TASK_PROTOCOL_RE.search(normalized_reply)
+    if match is None:
+        return normalized_reply, None
+
+    fields: dict[str, str] = {}
+    for raw_line in match.group("body").splitlines():
+        line = normalize_text(raw_line).strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = normalize_text(key).strip().lower()
+        normalized_value = normalize_text(value).strip()
+        if normalized_value:
+            fields[normalized_key] = normalized_value
+
+    visible_text = normalized_reply[:match.start()].strip()
+    stage = fields.get("stage")
+    current_step = fields.get("current_step")
+    expected_action = fields.get("expected_action")
+    transition = fields.get("transition", "").lower()
+    if stage is None or current_step is None or expected_action is None:
+        return visible_text, None
+    if transition not in {"auto", "confirm"}:
+        return visible_text, None
+    confirm_prompt = fields.get("confirm_prompt")
+    if transition == "confirm" and not confirm_prompt:
+        return visible_text, None
+    return (
+        visible_text,
+        AgentTaskUpdate(
+            stage=stage,
+            current_step=current_step,
+            expected_action=expected_action,
+            transition=transition,
+            confirm_prompt=confirm_prompt,
+        ),
+    )
+
+
+def _apply_agent_task_update(
+    storage: ChatStorage,
+    session_id: str,
+    task_update: AgentTaskUpdate | None,
+) -> TaskStateRecord | None:
+    if task_update is None:
+        return storage.get_task_state(session_id)
+    if task_update.transition == "confirm":
+        return storage.propose_task_state_transition(
+            session_id=session_id,
+            stage=task_update.stage,
+            current_step=task_update.current_step,
+            expected_action=task_update.expected_action,
+            confirmation_prompt=task_update.confirm_prompt or "Approve the transition?",
+        )
+    return storage.set_task_state(
+        session_id=session_id,
+        stage=task_update.stage,
+        current_step=task_update.current_step,
+        expected_action=task_update.expected_action,
+        is_paused=False,
+    )
+
+
+def _match_confirmation_reply(user_text: str) -> str | None:
+    normalized = normalize_text(user_text).strip().lower()
+    if normalized in _AFFIRMATIVE_CONFIRMATIONS:
+        return "approve"
+    if normalized in _NEGATIVE_CONFIRMATIONS:
+        return "reject"
+    return None
+
+
+def _task_bootstrap_user_text() -> str:
+    return (
+        "Start working on the task from the current task state. "
+        "First clarify any missing requirements or propose a short plan. "
+        "If you want to move beyond planning, require explicit confirmation."
+    )
+
+
+def _run_model_turn(
+    *,
+    model: ChatModel,
+    storage: ChatStorage,
+    session_id: str,
+    settings: Settings,
+    token_counter: TokenCounter,
+    context_manager: ContextManager,
+    user_text: str,
+    task_state: TaskStateRecord | None,
+) -> tuple[TaskStateRecord | None, list]:
+    normalized_user_text = normalize_text(user_text)
+    user_tokens = token_counter.count_text(normalized_user_text)
+    storage.append_message(session_id, "user", normalized_user_text, token_count=user_tokens)
+    message_records = storage.load_message_records(session_id)
+    context = context_manager.build_messages(
+        session_id=session_id,
+        message_records=message_records,
+    )
+    messages = context.messages
+    if task_state is not None:
+        messages = _inject_task_protocol(messages)
+    messages = _merge_system_messages(messages)
+    estimated_prompt_tokens = token_counter.count_messages(messages)
+    if estimated_prompt_tokens > settings.model_context_limit:
+        console.print(
+            "[dim red]"
+            f"Token warning: estimated prompt {estimated_prompt_tokens} "
+            f"> limit {settings.model_context_limit}. "
+            "Request may fail with context length error."
+            "[/dim red]"
+        )
+
+    try:
+        console.print("[bold blue]Assistant:[/bold blue] ", end="")
+        stream_printer = _TaskAwareStreamPrinter()
+        reply = model.reply_stream(
+            messages,
+            on_delta=stream_printer.push,
+        )
+        stream_printer.finish()
+    except BadRequestError as exc:  # pragma: no cover
+        error_text = str(exc)
+        if "maximum context length" in error_text.lower() or "context_length_exceeded" in error_text.lower():
+            console.print(
+                "[bold red]Request failed:[/bold red] "
+                "context length exceeded. Use /clear or shorten history."
+            )
+            console.print(
+                "[dim]"
+                f"Estimated prompt tokens: {estimated_prompt_tokens} "
+                f"(limit: {settings.model_context_limit})"
+                "[/dim]"
+            )
+        else:
+            console.print(f"[bold red]Request failed:[/bold red] {exc}")
+        console.print()
+        return task_state, storage.load_message_records(session_id)
+    except Exception as exc:  # pragma: no cover
+        console.print(f"[bold red]Request failed:[/bold red] {exc}")
+        console.print()
+        return task_state, storage.load_message_records(session_id)
+
+    reply_text = normalize_text(reply.text)
+    assistant_text, task_update = _extract_task_update(reply_text)
+    if task_state is None:
+        task_update = None
+    if not stream_printer.printed_anything and assistant_text:
+        console.print(assistant_text, end="", markup=False, highlight=False)
+    console.print()
+    next_task_state = _apply_agent_task_update(storage, session_id, task_update)
+    if next_task_state is not None:
+        console.print("[dim]Task state synced.[/dim]")
+        _print_task_state(next_task_state)
+        if next_task_state.awaiting_confirmation:
+            _print_task_confirmation(next_task_state)
+        console.print()
+
+    assistant_tokens = token_counter.count_text(assistant_text)
+    request_input_tokens = reply.usage.input_tokens if reply.usage else None
+    request_output_tokens = reply.usage.output_tokens if reply.usage else None
+    storage.append_message(
+        session_id,
+        "assistant",
+        assistant_text,
+        token_count=assistant_tokens,
+        request_input_tokens=request_input_tokens,
+        request_output_tokens=request_output_tokens,
+    )
+    return next_task_state, storage.load_message_records(session_id)
+
+
 def _print_model_profiles_table(settings: Settings) -> None:
     table = Table(title="Model Profiles")
     table.add_column("No.", justify="right")
@@ -220,11 +598,19 @@ def _chat_loop(
         user_profile=user_profile,
     )
     debug_enabled = False
+    task_state = storage.get_task_state(session_id)
 
     title = f"chat-agent | session #{session_id} | model {_format_model_label(settings)}"
     if branch_commands_enabled:
         title += f" | branch {storage.get_active_branch_name(session_id) or 'main'}"
-    commands_line = "Commands: /exit, /clear, /debug, /stats, /summary, /compact, /model"
+    if task_state is not None:
+        title += f" | task {task_state.stage}"
+        if task_state.is_paused:
+            title += " paused"
+    commands_line = (
+        "Commands: /exit, /clear, /debug, /stats, /summary, /compact, /model, "
+        "/pause, /continue"
+    )
     if branch_commands_enabled:
         commands_line += ", /checkpoint, /branch, /branches, /switch"
     if memory_commands_enabled:
@@ -245,6 +631,10 @@ def _chat_loop(
             "tiktoken is not installed, token counts are approximate."
             "[/dim yellow]"
         )
+    if task_state is not None:
+        _print_task_state(task_state)
+        _print_task_confirmation(task_state)
+        console.print()
     if show_history:
         _print_chat_history(
             [{"role": row.role, "content": row.content} for row in message_records]
@@ -268,6 +658,7 @@ def _chat_loop(
                     system_prompt,
                     token_count=token_counter.count_text(system_prompt),
                 )
+                task_state = None
                 message_records = storage.load_message_records(session_id)
                 console.print("[yellow]History cleared.[/yellow]")
                 console.print()
@@ -291,6 +682,109 @@ def _chat_loop(
                 continue
             if command == "/summary":
                 _print_session_summaries(storage.list_session_summaries(session_id))
+                console.print()
+                continue
+            if command == "/task":
+                payload = user_text[len("/task"):].strip()
+                if not payload:
+                    _print_task_state(storage.get_task_state(session_id))
+                    console.print()
+                    continue
+                lowered_payload = payload.lower()
+                if lowered_payload.startswith("set "):
+                    try:
+                        stage, current_step, expected_action = _parse_task_set_command(payload[4:])
+                        task_state = storage.set_task_state(
+                            session_id=session_id,
+                            stage=stage,
+                            current_step=current_step,
+                            expected_action=expected_action,
+                        )
+                    except ValueError as exc:
+                        console.print(f"[bold red]Task update failed:[/bold red] {exc}")
+                        console.print()
+                        continue
+                    console.print("[yellow]Task state updated.[/yellow]")
+                    _print_task_state(task_state)
+                    console.print()
+                    continue
+                if lowered_payload.startswith("next "):
+                    try:
+                        current_step, expected_action = _parse_task_fields(payload[5:])
+                        task_state = storage.advance_task_state(
+                            session_id=session_id,
+                            current_step=current_step,
+                            expected_action=expected_action,
+                        )
+                    except ValueError as exc:
+                        console.print(f"[bold red]Task transition failed:[/bold red] {exc}")
+                        console.print()
+                        continue
+                    console.print("[yellow]Task advanced to next stage.[/yellow]")
+                    _print_task_state(task_state)
+                    console.print()
+                    continue
+                try:
+                    stage, current_step, expected_action = _build_task_goal_state(payload)
+                    task_state = storage.set_task_state(
+                        session_id=session_id,
+                        stage=stage,
+                        current_step=current_step,
+                        expected_action=expected_action,
+                    )
+                except ValueError as exc:
+                    console.print(f"[bold red]Task update failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                console.print("[yellow]Task state updated.[/yellow]")
+                _print_task_state(task_state)
+                console.print()
+                task_state, message_records = _run_model_turn(
+                    model=model,
+                    storage=storage,
+                    session_id=session_id,
+                    settings=settings,
+                    token_counter=token_counter,
+                    context_manager=context_manager,
+                    user_text=_task_bootstrap_user_text(),
+                    task_state=task_state,
+                )
+                if debug_enabled:
+                    _print_debug_snapshot(
+                        storage=storage,
+                        session_id=session_id,
+                        session_config=session_config,
+                        message_records=message_records,
+                    )
+                continue
+            if command == "/pause":
+                pause_action = user_text[len("/pause"):].strip() or None
+                try:
+                    task_state = storage.pause_task(
+                        session_id=session_id,
+                        expected_action=pause_action,
+                    )
+                except ValueError as exc:
+                    console.print(f"[bold red]Pause failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                console.print("[yellow]Task paused.[/yellow]")
+                _print_task_state(task_state)
+                console.print()
+                continue
+            if command == "/continue":
+                continue_action = user_text[len("/continue"):].strip() or None
+                try:
+                    task_state = storage.resume_task(
+                        session_id=session_id,
+                        expected_action=continue_action,
+                    )
+                except ValueError as exc:
+                    console.print(f"[bold red]Continue failed:[/bold red] {exc}")
+                    console.print()
+                    continue
+                console.print("[yellow]Task resumed.[/yellow]")
+                _print_task_state(task_state)
                 console.print()
                 continue
             if command == "/model":
@@ -452,7 +946,35 @@ def _chat_loop(
             console.print(
                 "[yellow]Unknown command. Available commands: "
                 "/exit, /clear, /debug, /stats, /summary, /compact, /model, "
+                "/pause, /continue, "
                 "/memory, /checkpoint, /branch, /branches, /switch[/yellow]"
+            )
+            console.print()
+            continue
+
+        if task_state is not None and task_state.awaiting_confirmation:
+            confirmation_reply = _match_confirmation_reply(user_text)
+            if confirmation_reply == "approve":
+                task_state = storage.approve_pending_task_transition(session_id)
+                console.print("[yellow]Task transition confirmed.[/yellow]")
+                _print_task_state(task_state)
+                console.print()
+                user_text = "Continue from the approved task state without repeating earlier context."
+            elif confirmation_reply == "reject":
+                task_state = storage.reject_pending_task_transition(session_id)
+                console.print("[yellow]Task transition canceled.[/yellow]")
+                _print_task_state(task_state)
+                console.print()
+                continue
+            else:
+                task_state = storage.reject_pending_task_transition(
+                    session_id,
+                    expected_action="Process the user's updated guidance",
+                )
+
+        if task_state is not None and task_state.is_paused and not task_state.awaiting_confirmation:
+            console.print(
+                "[yellow]Task is paused. Use /continue to resume it before sending more messages.[/yellow]"
             )
             console.print()
             continue
@@ -466,6 +988,9 @@ def _chat_loop(
             message_records=message_records,
         )
         messages = context.messages
+        if task_state is not None:
+            messages = _inject_task_protocol(messages)
+        messages = _merge_system_messages(messages)
         estimated_prompt_tokens = token_counter.count_messages(messages)
         if estimated_prompt_tokens > settings.model_context_limit:
             console.print(
@@ -478,15 +1003,13 @@ def _chat_loop(
 
         try:
             console.print("[bold blue]Assistant:[/bold blue] ", end="")
+            stream_printer = _TaskAwareStreamPrinter()
             reply = model.reply_stream(
                 messages,
-                on_delta=lambda chunk: console.print(
-                    chunk, end="", markup=False, highlight=False
-                ),
+                on_delta=stream_printer.push,
             )
-            console.print()
+            stream_printer.finish()
         except BadRequestError as exc:  # pragma: no cover
-            console.print()
             error_text = str(exc)
             if "maximum context length" in error_text.lower() or "context_length_exceeded" in error_text.lower():
                 console.print(
@@ -505,13 +1028,26 @@ def _chat_loop(
             message_records = storage.load_message_records(session_id)
             continue
         except Exception as exc:  # pragma: no cover
-            console.print()
             console.print(f"[bold red]Request failed:[/bold red] {exc}")
             console.print()
             message_records = storage.load_message_records(session_id)
             continue
 
-        assistant_text = normalize_text(reply.text)
+        reply_text = normalize_text(reply.text)
+        assistant_text, task_update = _extract_task_update(reply_text)
+        if task_state is None:
+            task_update = None
+        if not stream_printer.printed_anything and assistant_text:
+            console.print(assistant_text, end="", markup=False, highlight=False)
+        console.print()
+        task_state = _apply_agent_task_update(storage, session_id, task_update)
+        if task_state is not None:
+            console.print("[dim]Task state synced.[/dim]")
+            _print_task_state(task_state)
+            if task_state.awaiting_confirmation:
+                _print_task_confirmation(task_state)
+            console.print()
+
         assistant_tokens = token_counter.count_text(assistant_text)
         request_input_tokens = reply.usage.input_tokens if reply.usage else None
         request_output_tokens = reply.usage.output_tokens if reply.usage else None

@@ -24,7 +24,7 @@ def test_load_settings_uses_model_profiles_from_toml(monkeypatch, tmp_path) -> N
     models_path.write_text(
         textwrap.dedent(
             """
-            default_model = "local"
+            default = "local"
 
             [models.remote]
             api_key_env = "REMOTE_API_KEY"
@@ -60,6 +60,99 @@ def test_load_settings_uses_model_profiles_from_toml(monkeypatch, tmp_path) -> N
     assert settings.available_model_aliases == ("remote", "local")
 
 
+def test_load_settings_prefers_local_profile_by_default(monkeypatch, tmp_path) -> None:
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(
+        textwrap.dedent(
+            """
+            [models.remote]
+            api_key_env = "REMOTE_API_KEY"
+            base_url = "https://api.example.com/v1"
+            model = "gpt-4.1-mini"
+
+            [models.local]
+            api_key = "lm-studio"
+            base_url = "http://localhost:1234/v1"
+            model = "qwen/qwen3.5-9b"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CHAT_MODELS_PATH", str(models_path))
+    monkeypatch.setenv("REMOTE_API_KEY", "remote-secret")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_DEFAULT_MODEL", raising=False)
+
+    settings = load_settings()
+
+    assert settings.model_alias == "remote"
+    assert settings.base_url == "https://api.example.com/v1"
+    assert settings.model == "gpt-4.1-mini"
+
+
+def test_load_settings_explicit_default_overrides_local_preference(monkeypatch, tmp_path) -> None:
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(
+        textwrap.dedent(
+            """
+            default = "remote"
+
+            [models.remote]
+            api_key_env = "REMOTE_API_KEY"
+            base_url = "https://api.example.com/v1"
+            model = "gpt-4.1-mini"
+
+            [models.local]
+            api_key = "lm-studio"
+            base_url = "http://localhost:1234/v1"
+            model = "qwen/qwen3.5-9b"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CHAT_MODELS_PATH", str(models_path))
+    monkeypatch.setenv("REMOTE_API_KEY", "remote-secret")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    settings = load_settings()
+
+    assert settings.model_alias == "remote"
+    assert settings.base_url == "https://api.example.com/v1"
+
+
+def test_load_settings_supports_legacy_default_model_key(monkeypatch, tmp_path) -> None:
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(
+        textwrap.dedent(
+            """
+            default_model = "local"
+
+            [models.remote]
+            api_key_env = "REMOTE_API_KEY"
+            base_url = "https://api.example.com/v1"
+            model = "gpt-4.1-mini"
+
+            [models.local]
+            api_key = "lm-studio"
+            base_url = "http://localhost:1234/v1"
+            model = "qwen/qwen3.5-9b"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CHAT_MODELS_PATH", str(models_path))
+    monkeypatch.setenv("REMOTE_API_KEY", "remote-secret")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    settings = load_settings()
+
+    assert settings.model_alias == "local"
+    assert settings.base_url == "http://localhost:1234/v1"
+
+
 def test_load_settings_uses_home_chat_agent_models_path_by_default(monkeypatch, tmp_path) -> None:
     models_dir = tmp_path / ".chat-agent"
     models_dir.mkdir(parents=True)
@@ -67,7 +160,7 @@ def test_load_settings_uses_home_chat_agent_models_path_by_default(monkeypatch, 
     models_path.write_text(
         textwrap.dedent(
             """
-            default_model = "routerai"
+            default = "routerai"
 
             [models.routerai]
             api_key = "secret"

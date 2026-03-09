@@ -34,7 +34,7 @@
 Если нужно переключаться между локальной и удалённой моделями, создайте `~/.chat-agent/models.toml`:
 
 ```toml
-default_model = "remote"
+default = "remote"
 
 [models.remote]
 api_key_env = "OPENAI_API_KEY"
@@ -55,6 +55,7 @@ output_cost_per_1m = 0
 
 Поддерживаются поля:
 
+- `default` - alias профиля, который открывается по умолчанию
 - `api_key` - ключ прямо в профиле
 - `api_key_env` - имя env-переменной, из которой брать ключ
 - `base_url` - URL API для профиля

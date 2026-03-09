@@ -160,7 +160,9 @@ def _load_model_profiles(
             default_output_cost=default_output_cost,
         )
 
-    default_model = raw.get("default_model")
+    default_model = raw.get("default")
+    if default_model is None:
+        default_model = raw.get("default_model")
     normalized_default = str(default_model).strip() if default_model is not None else None
     if normalized_default == "":
         normalized_default = None

@@ -14,6 +14,30 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_TASK_STAGES = ("planning", "execution", "validation", "done")
+_NEXT_TASK_STAGE = {
+    "planning": "execution",
+    "execution": "validation",
+    "validation": "done",
+}
+
+
+def _normalize_task_stage(stage: str) -> str:
+    normalized = normalize_text(stage).strip().lower()
+    if normalized not in _TASK_STAGES:
+        raise ValueError(
+            "Task stage must be one of: " + ", ".join(_TASK_STAGES)
+        )
+    return normalized
+
+
+def _normalize_task_field(field_name: str, value: str) -> str:
+    normalized = normalize_text(value).strip()
+    if not normalized:
+        raise ValueError(f"Task {field_name} cannot be empty")
+    return normalized
+
+
 @dataclass(slots=True)
 class SessionSummary:
     session_id: str
@@ -71,6 +95,22 @@ class SessionFactRecord:
 class MemoryRecord:
     key: str
     value: str
+
+
+@dataclass(slots=True)
+class TaskStateRecord:
+    stage: str
+    current_step: str
+    expected_action: str
+    is_paused: bool
+    pending_stage: str | None = None
+    pending_current_step: str | None = None
+    pending_expected_action: str | None = None
+    pending_confirmation_prompt: str | None = None
+
+    @property
+    def awaiting_confirmation(self) -> bool:
+        return self.pending_stage is not None
 
 
 @dataclass(slots=True)
@@ -183,6 +223,24 @@ class ChatStorage:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS session_task_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL UNIQUE,
+                    stage TEXT NOT NULL,
+                    current_step TEXT NOT NULL,
+                    expected_action TEXT NOT NULL,
+                    is_paused INTEGER NOT NULL DEFAULT 0,
+                    pending_stage TEXT,
+                    pending_current_step TEXT,
+                    pending_expected_action TEXT,
+                    pending_confirmation_prompt TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS session_branches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL,
@@ -211,6 +269,7 @@ class ChatStorage:
             self._migrate_sessions_context(conn)
             self._migrate_sessions_models(conn)
             self._migrate_messages_tokens(conn)
+            self._migrate_task_state(conn)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_session_summaries_session_id
@@ -573,6 +632,353 @@ class ChatStorage:
             table_name="session_long_term_memory",
         )
 
+    def get_task_state(self, session_id: str) -> TaskStateRecord | None:
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            return self._get_task_state_row(conn, db_session_id)
+
+    def set_task_state(
+        self,
+        session_id: str,
+        stage: str,
+        current_step: str,
+        expected_action: str,
+        is_paused: bool | None = None,
+        pending_stage: str | None = None,
+        pending_current_step: str | None = None,
+        pending_expected_action: str | None = None,
+        pending_confirmation_prompt: str | None = None,
+    ) -> TaskStateRecord:
+        normalized_stage = _normalize_task_stage(stage)
+        normalized_step = _normalize_task_field("current step", current_step)
+        normalized_action = _normalize_task_field("expected action", expected_action)
+        normalized_pending_stage = (
+            _normalize_task_stage(pending_stage) if pending_stage is not None else None
+        )
+        normalized_pending_step = (
+            _normalize_task_field("pending current step", pending_current_step)
+            if pending_current_step is not None
+            else None
+        )
+        normalized_pending_action = (
+            _normalize_task_field("pending expected action", pending_expected_action)
+            if pending_expected_action is not None
+            else None
+        )
+        normalized_pending_prompt = (
+            _normalize_task_field("pending confirmation prompt", pending_confirmation_prompt)
+            if pending_confirmation_prompt is not None
+            else None
+        )
+        self._validate_pending_task_state(
+            pending_stage=normalized_pending_stage,
+            pending_current_step=normalized_pending_step,
+            pending_expected_action=normalized_pending_action,
+            pending_confirmation_prompt=normalized_pending_prompt,
+        )
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._get_task_state_row(conn, db_session_id)
+            self._validate_task_transition(
+                current_stage=current_state.stage if current_state is not None else None,
+                new_stage=normalized_stage,
+            )
+            paused_value = (
+                current_state.is_paused if current_state is not None and is_paused is None else bool(is_paused)
+            )
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=normalized_stage,
+                current_step=normalized_step,
+                expected_action=normalized_action,
+                is_paused=paused_value,
+                pending_stage=normalized_pending_stage,
+                pending_current_step=normalized_pending_step,
+                pending_expected_action=normalized_pending_action,
+                pending_confirmation_prompt=normalized_pending_prompt,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=normalized_stage,
+            current_step=normalized_step,
+            expected_action=normalized_action,
+            is_paused=paused_value,
+            pending_stage=normalized_pending_stage,
+            pending_current_step=normalized_pending_step,
+            pending_expected_action=normalized_pending_action,
+            pending_confirmation_prompt=normalized_pending_prompt,
+        )
+
+    def advance_task_state(
+        self,
+        session_id: str,
+        current_step: str,
+        expected_action: str,
+    ) -> TaskStateRecord:
+        normalized_step = _normalize_task_field("current step", current_step)
+        normalized_action = _normalize_task_field("expected action", expected_action)
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            next_stage = _NEXT_TASK_STAGE.get(current_state.stage)
+            if next_stage is None:
+                raise ValueError("Task is already in terminal stage 'done'")
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=next_stage,
+                current_step=normalized_step,
+                expected_action=normalized_action,
+                is_paused=False,
+                pending_stage=None,
+                pending_current_step=None,
+                pending_expected_action=None,
+                pending_confirmation_prompt=None,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=next_stage,
+            current_step=normalized_step,
+            expected_action=normalized_action,
+            is_paused=False,
+            pending_stage=None,
+            pending_current_step=None,
+            pending_expected_action=None,
+            pending_confirmation_prompt=None,
+        )
+
+    def propose_task_state_transition(
+        self,
+        session_id: str,
+        stage: str,
+        current_step: str,
+        expected_action: str,
+        confirmation_prompt: str,
+    ) -> TaskStateRecord:
+        normalized_stage = _normalize_task_stage(stage)
+        normalized_step = _normalize_task_field("current step", current_step)
+        normalized_action = _normalize_task_field("expected action", expected_action)
+        normalized_prompt = _normalize_task_field(
+            "pending confirmation prompt",
+            confirmation_prompt,
+        )
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            self._validate_task_transition(
+                current_stage=current_state.stage,
+                new_stage=normalized_stage,
+            )
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=current_state.stage,
+                current_step=current_state.current_step,
+                expected_action=current_state.expected_action,
+                is_paused=True,
+                pending_stage=normalized_stage,
+                pending_current_step=normalized_step,
+                pending_expected_action=normalized_action,
+                pending_confirmation_prompt=normalized_prompt,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=current_state.stage,
+            current_step=current_state.current_step,
+            expected_action=current_state.expected_action,
+            is_paused=True,
+            pending_stage=normalized_stage,
+            pending_current_step=normalized_step,
+            pending_expected_action=normalized_action,
+            pending_confirmation_prompt=normalized_prompt,
+        )
+
+    def approve_pending_task_transition(self, session_id: str) -> TaskStateRecord:
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            if not current_state.awaiting_confirmation:
+                raise ValueError("Task transition is not awaiting confirmation")
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=current_state.pending_stage,
+                current_step=current_state.pending_current_step,
+                expected_action=current_state.pending_expected_action,
+                is_paused=False,
+                pending_stage=None,
+                pending_current_step=None,
+                pending_expected_action=None,
+                pending_confirmation_prompt=None,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=current_state.pending_stage,
+            current_step=current_state.pending_current_step,
+            expected_action=current_state.pending_expected_action,
+            is_paused=False,
+        )
+
+    def reject_pending_task_transition(
+        self,
+        session_id: str,
+        expected_action: str | None = None,
+    ) -> TaskStateRecord:
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            if not current_state.awaiting_confirmation:
+                raise ValueError("Task transition is not awaiting confirmation")
+            next_action = current_state.expected_action
+            if expected_action is not None:
+                next_action = _normalize_task_field("expected action", expected_action)
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=current_state.stage,
+                current_step=current_state.current_step,
+                expected_action=next_action,
+                is_paused=False,
+                pending_stage=None,
+                pending_current_step=None,
+                pending_expected_action=None,
+                pending_confirmation_prompt=None,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=current_state.stage,
+            current_step=current_state.current_step,
+            expected_action=next_action,
+            is_paused=False,
+        )
+
+    def pause_task(
+        self,
+        session_id: str,
+        expected_action: str | None = None,
+    ) -> TaskStateRecord:
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            next_action = current_state.expected_action
+            if expected_action is not None:
+                next_action = _normalize_task_field("expected action", expected_action)
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=current_state.stage,
+                current_step=current_state.current_step,
+                expected_action=next_action,
+                is_paused=True,
+                pending_stage=current_state.pending_stage,
+                pending_current_step=current_state.pending_current_step,
+                pending_expected_action=current_state.pending_expected_action,
+                pending_confirmation_prompt=current_state.pending_confirmation_prompt,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=current_state.stage,
+            current_step=current_state.current_step,
+            expected_action=next_action,
+            is_paused=True,
+            pending_stage=current_state.pending_stage,
+            pending_current_step=current_state.pending_current_step,
+            pending_expected_action=current_state.pending_expected_action,
+            pending_confirmation_prompt=current_state.pending_confirmation_prompt,
+        )
+
+    def resume_task(
+        self,
+        session_id: str,
+        expected_action: str | None = None,
+    ) -> TaskStateRecord:
+        now = _now_iso()
+
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            current_state = self._require_task_state(conn, db_session_id)
+            next_action = current_state.expected_action
+            if expected_action is not None:
+                next_action = _normalize_task_field("expected action", expected_action)
+            self._upsert_task_state(
+                conn=conn,
+                db_session_id=db_session_id,
+                stage=current_state.stage,
+                current_step=current_state.current_step,
+                expected_action=next_action,
+                is_paused=False,
+                pending_stage=current_state.pending_stage,
+                pending_current_step=current_state.pending_current_step,
+                pending_expected_action=current_state.pending_expected_action,
+                pending_confirmation_prompt=current_state.pending_confirmation_prompt,
+                updated_at=now,
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return TaskStateRecord(
+            stage=current_state.stage,
+            current_step=current_state.current_step,
+            expected_action=next_action,
+            is_paused=False,
+            pending_stage=current_state.pending_stage,
+            pending_current_step=current_state.pending_current_step,
+            pending_expected_action=current_state.pending_expected_action,
+            pending_confirmation_prompt=current_state.pending_confirmation_prompt,
+        )
+
     def create_checkpoint(self, session_id: str, name: str) -> CheckpointRecord:
         checkpoint_name = normalize_text(name).strip()
         if not checkpoint_name:
@@ -901,6 +1307,7 @@ class ChatStorage:
             conn.execute("DELETE FROM session_facts WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM session_working_memory WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM session_long_term_memory WHERE session_id = ?", (db_session_id,))
+            conn.execute("DELETE FROM session_task_state WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM branch_checkpoints WHERE session_id = ?", (db_session_id,))
             conn.execute("DELETE FROM session_branches WHERE session_id = ?", (db_session_id,))
 
@@ -1033,6 +1440,22 @@ class ChatStorage:
             conn.execute("ALTER TABLE messages ADD COLUMN request_output_tokens INTEGER")
 
     @staticmethod
+    def _migrate_task_state(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(session_task_state)").fetchall()
+        }
+        if "pending_stage" not in columns:
+            conn.execute("ALTER TABLE session_task_state ADD COLUMN pending_stage TEXT")
+        if "pending_current_step" not in columns:
+            conn.execute("ALTER TABLE session_task_state ADD COLUMN pending_current_step TEXT")
+        if "pending_expected_action" not in columns:
+            conn.execute("ALTER TABLE session_task_state ADD COLUMN pending_expected_action TEXT")
+        if "pending_confirmation_prompt" not in columns:
+            conn.execute(
+                "ALTER TABLE session_task_state ADD COLUMN pending_confirmation_prompt TEXT"
+            )
+
+    @staticmethod
     def _map_message_rows(rows: list[tuple[object, ...]]) -> list[MessageRecord]:
         return [
             MessageRecord(
@@ -1096,6 +1519,161 @@ class ChatStorage:
                 (session_id,),
             ).fetchall()
         return [MemoryRecord(key=str(row[0]), value=str(row[1])) for row in rows]
+
+    @staticmethod
+    def _get_task_state_row(
+        conn: sqlite3.Connection,
+        db_session_id: int,
+    ) -> TaskStateRecord | None:
+        row = conn.execute(
+            """
+            SELECT
+                stage,
+                current_step,
+                expected_action,
+                is_paused,
+                pending_stage,
+                pending_current_step,
+                pending_expected_action,
+                pending_confirmation_prompt
+            FROM session_task_state
+            WHERE session_id = ?
+            """,
+            (db_session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return TaskStateRecord(
+            stage=str(row[0]),
+            current_step=str(row[1]),
+            expected_action=str(row[2]),
+            is_paused=bool(int(row[3])),
+            pending_stage=str(row[4]) if row[4] is not None else None,
+            pending_current_step=str(row[5]) if row[5] is not None else None,
+            pending_expected_action=str(row[6]) if row[6] is not None else None,
+            pending_confirmation_prompt=str(row[7]) if row[7] is not None else None,
+        )
+
+    @staticmethod
+    def _require_task_state(
+        conn: sqlite3.Connection,
+        db_session_id: int,
+    ) -> TaskStateRecord:
+        state = ChatStorage._get_task_state_row(conn, db_session_id)
+        if state is None:
+            raise ValueError("Task state is not set")
+        return state
+
+    @staticmethod
+    def _validate_task_transition(
+        current_stage: str | None,
+        new_stage: str,
+    ) -> None:
+        if current_stage is None or current_stage == new_stage:
+            return
+        if current_stage == "done" and new_stage == "planning":
+            return
+        next_stage = _NEXT_TASK_STAGE.get(current_stage)
+        if next_stage != new_stage:
+            raise ValueError(
+                f"Invalid task stage transition: {current_stage} -> {new_stage}"
+            )
+
+    @staticmethod
+    def _upsert_task_state(
+        conn: sqlite3.Connection,
+        db_session_id: int,
+        stage: str,
+        current_step: str,
+        expected_action: str,
+        is_paused: bool,
+        pending_stage: str | None,
+        pending_current_step: str | None,
+        pending_expected_action: str | None,
+        pending_confirmation_prompt: str | None,
+        updated_at: str,
+    ) -> None:
+        existing = conn.execute(
+            "SELECT id FROM session_task_state WHERE session_id = ?",
+            (db_session_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO session_task_state (
+                    session_id,
+                    stage,
+                    current_step,
+                    expected_action,
+                    is_paused,
+                    pending_stage,
+                    pending_current_step,
+                    pending_expected_action,
+                    pending_confirmation_prompt,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    db_session_id,
+                    stage,
+                    current_step,
+                    expected_action,
+                    int(is_paused),
+                    pending_stage,
+                    pending_current_step,
+                    pending_expected_action,
+                    pending_confirmation_prompt,
+                    updated_at,
+                ),
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE session_task_state
+            SET stage = ?,
+                current_step = ?,
+                expected_action = ?,
+                is_paused = ?,
+                pending_stage = ?,
+                pending_current_step = ?,
+                pending_expected_action = ?,
+                pending_confirmation_prompt = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                stage,
+                current_step,
+                expected_action,
+                int(is_paused),
+                pending_stage,
+                pending_current_step,
+                pending_expected_action,
+                pending_confirmation_prompt,
+                updated_at,
+                db_session_id,
+            ),
+        )
+
+    @staticmethod
+    def _validate_pending_task_state(
+        pending_stage: str | None,
+        pending_current_step: str | None,
+        pending_expected_action: str | None,
+        pending_confirmation_prompt: str | None,
+    ) -> None:
+        values = (
+            pending_stage,
+            pending_current_step,
+            pending_expected_action,
+            pending_confirmation_prompt,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise ValueError("Pending task transition must include all fields")
 
     def _load_branching_message_records(
         self,

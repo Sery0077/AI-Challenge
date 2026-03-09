@@ -82,6 +82,10 @@ class ChatModel:
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
         total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        if input_tokens == 0:
+            input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        if output_tokens == 0:
+            output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         if input_tokens == 0 and output_tokens == 0 and total_tokens == 0:
             return None
         if total_tokens == 0:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from chat_agent_cli import cli
 from chat_agent_cli.config import Settings
+from chat_agent_cli.context import ContextManager
 from chat_agent_cli.llm import ChatReply, ResponseUsage
 from chat_agent_cli.storage import ChatStorage
+from chat_agent_cli.user_profile import UserProfile
 
 
 class FakeConsole:
@@ -56,6 +59,105 @@ class FakeModel:
             raise self.error
         on_delta(self.text)
         return ChatReply(text=self.text, usage=self.usage)
+
+
+@dataclass
+class TaskStateAwareModel:
+    def reply_stream(self, messages, on_delta):
+        answer = self._answer(messages)
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+    def _answer(self, messages: list[dict[str, str]]) -> str:
+        last_user = next(
+            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+            "",
+        )
+        if "continue without repeating context" not in last_user.lower():
+            return "ack"
+
+        task_message = next(
+            (
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "system"
+                and "Task state:" in message.get("content", "")
+            ),
+            "",
+        )
+        fields: dict[str, str] = {}
+        for line in task_message.splitlines():
+            match = re.match(r"^([a-z_]+):\s+(.+)$", line.strip())
+            if match is None:
+                continue
+            fields[match.group(1)] = match.group(2)
+        return (
+            f"stage={fields.get('stage', 'UNKNOWN')} "
+            f"status={fields.get('status', 'UNKNOWN')} "
+            f"step={fields.get('current_step', 'UNKNOWN')} "
+            f"next={fields.get('expected_action', 'UNKNOWN')}"
+        )
+
+
+@dataclass
+class ConfirmingTaskStateModel:
+    def reply_stream(self, messages, on_delta):
+        last_user = next(
+            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+            "",
+        )
+        if "approved task state" in last_user.lower():
+            answer = (
+                "Continuing from the approved state.\n"
+                "<<TASK_STATE>>\n"
+                "stage: execution\n"
+                "current_step: Implement automatic task transitions\n"
+                "expected_action: Validate resumed task flow\n"
+                "transition: auto\n"
+                "<<END_TASK_STATE>>"
+            )
+        else:
+            answer = (
+                "I have the plan and need approval before execution.\n"
+                "<<TASK_STATE>>\n"
+                "stage: execution\n"
+                "current_step: Implement automatic task transitions\n"
+                "expected_action: Validate resumed task flow\n"
+                "transition: confirm\n"
+                "confirm_prompt: Move the task to execution and continue?\n"
+                "<<END_TASK_STATE>>"
+            )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class StreamingTaskProtocolModel:
+    def reply_stream(self, _messages, on_delta):
+        chunks = [
+            "Streaming ",
+            "answer",
+            " before ",
+            "metadata.\n<<TASK_",
+            "STATE>>\nstage: execution\n",
+            "current_step: Stream the visible reply\n",
+            "expected_action: Persist the task state\n",
+            "transition: auto\n",
+            "<<END_TASK_STATE>>",
+        ]
+        for chunk in chunks:
+            on_delta(chunk)
+        return ChatReply(text="".join(chunks), usage=None)
+
+
+@dataclass
+class SystemMessageInspectingModel:
+    seen_messages: list[dict[str, str]] | None = None
+
+    def reply_stream(self, messages, on_delta):
+        self.seen_messages = [dict(message) for message in messages]
+        on_delta("ack")
+        return ChatReply(text="ack", usage=None)
 
 
 def _settings(
@@ -137,6 +239,39 @@ def test_chat_loop_sanitizes_surrogate_user_input(monkeypatch, tmp_path) -> None
     user_messages = [row.content for row in records if row.role == "user"]
 
     assert user_messages == ["Числа ?поездки 10.09-15.09"]
+
+
+def test_chat_loop_merges_system_messages_before_model_request(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    model = SystemMessageInspectingModel()
+
+    fake_console = FakeConsole(inputs=["hello", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+    monkeypatch.setattr(
+        cli,
+        "load_user_profile",
+        lambda _path: UserProfile(
+            user_id="default",
+            name="Sergey",
+            preferences={"style": {"verbosity": "short"}},
+        ),
+    )
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    assert model.seen_messages is not None
+    system_messages = [message for message in model.seen_messages if message["role"] == "system"]
+    assert len(system_messages) == 1
+    assert "You are test assistant." in system_messages[0]["content"]
+    assert "User profile:" in system_messages[0]["content"]
 
 
 def test_chat_loop_summary_command(monkeypatch, tmp_path) -> None:
@@ -433,6 +568,351 @@ def test_chat_loop_context_overflow(monkeypatch, tmp_path) -> None:
 
     assert any("Token warning" in line for line in fake_console.print_calls)
     assert any("context length exceeded" in line for line in fake_console.print_calls)
+
+
+def test_chat_loop_task_state_survives_pause_and_restart(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+
+    first_console = FakeConsole(
+        inputs=[
+            "/task set planning Clarify requirements | Inspect the repository",
+            "We need a formal task state with planning, execution, validation, and done.",
+            "Capture another implementation detail.",
+            "One more note that should push old context out of the sliding window.",
+            "/task next Implement task state storage | Inject task state into prompt context",
+            "/pause Wait for resume",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", first_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=TaskStateAwareModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    paused_state = storage.get_task_state(session_id)
+    assert paused_state is not None
+    assert paused_state.stage == "execution"
+    assert paused_state.is_paused is True
+    assert any("Task state updated." in line for line in first_console.print_calls)
+    assert any("Task advanced to next stage." in line for line in first_console.print_calls)
+    assert any("Task paused." in line for line in first_console.print_calls)
+
+    manager = ContextManager(storage=storage, token_counter=FakeTokenCounter("gpt-4.1-mini"))
+    built = manager.build_messages(session_id, storage.load_message_records(session_id))
+    system_contents = [message["content"] for message in built.messages if message["role"] == "system"]
+    non_system_contents = [message["content"] for message in built.messages if message["role"] != "system"]
+
+    assert any(content.startswith("Task state:") for content in system_contents)
+    assert (
+        "We need a formal task state with planning, execution, validation, and done."
+        not in non_system_contents
+    )
+
+    second_console = FakeConsole(
+        inputs=[
+            "/continue Validate resumed task flow",
+            "continue without repeating context",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", second_console)
+
+    cli._chat_loop(
+        model=TaskStateAwareModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    resumed_state = storage.get_task_state(session_id)
+    assert resumed_state is not None
+    assert resumed_state.stage == "execution"
+    assert resumed_state.is_paused is False
+    assert resumed_state.expected_action == "Validate resumed task flow"
+    resumed_output = "".join(second_console.print_calls)
+    assert any("Task resumed." in line for line in second_console.print_calls)
+    assert "Stage: execution" in resumed_output
+    assert "Status: active" in resumed_output
+    assert "Current: Implement task state storage" in resumed_output
+    assert "next=Validate resumed task flow" in resumed_output
+
+
+def test_task_command_initializes_planning_state_from_goal_and_bootstraps_model(
+    monkeypatch, tmp_path
+) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+
+    fake_console = FakeConsole(inputs=["/task Fix LM Studio compatibility", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=ConfirmingTaskStateModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "planning"
+    assert task_state.is_paused is True
+    assert task_state.awaiting_confirmation is True
+    assert task_state.current_step == "Fix LM Studio compatibility"
+    assert task_state.expected_action == "Clarify requirements and define the next concrete step"
+    assert any("Task state updated." in line for line in fake_console.print_calls)
+    assert any("I have the plan and need approval before execution." in line for line in fake_console.print_calls)
+    assert any("Awaiting confirmation:" in line for line in fake_console.print_calls)
+
+
+def test_chat_loop_paused_task_requires_continue(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=2,
+    )
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement task state storage",
+        expected_action="Wait for resume",
+        is_paused=True,
+    )
+
+    fake_console = FakeConsole(inputs=["continue without repeating context", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=TaskStateAwareModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    paused_state = storage.get_task_state(session_id)
+    assert paused_state is not None
+    assert paused_state.is_paused is True
+    assert any("Task is paused. Use /continue to resume it" in line for line in fake_console.print_calls)
+    assert not any("Stage: execution\nStatus: active" in line for line in fake_console.print_calls)
+
+
+def test_task_command_without_state_shows_goal_hint(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+
+    fake_console = FakeConsole(inputs=["/task", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=FakeModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    assert any("Use /task <goal> to initialize it." in line for line in fake_console.print_calls)
+
+
+def test_chat_loop_does_not_create_task_state_from_regular_messages(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=1,
+    )
+
+    first_console = FakeConsole(
+        inputs=[
+            "Build a persisted FSM for task state and continue automatically.",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", first_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=ConfirmingTaskStateModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    assert storage.get_task_state(session_id) is None
+    printed_output = "".join(first_console.print_calls)
+    assert "Awaiting confirmation:" not in printed_output
+    assert "Task state synced." not in printed_output
+    assert "I have the plan and need approval before execution." in printed_output
+
+
+def test_chat_loop_task_confirmation_requires_explicit_task_mode(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=1,
+    )
+
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Prepare the first execution step",
+    )
+
+    first_console = FakeConsole(
+        inputs=[
+            "Build a persisted FSM for task state and continue automatically.",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", first_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=ConfirmingTaskStateModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    paused_state = storage.get_task_state(session_id)
+    assert paused_state is not None
+    assert paused_state.stage == "planning"
+    assert paused_state.is_paused is True
+    assert paused_state.awaiting_confirmation is True
+    assert paused_state.pending_stage == "execution"
+    assert any("Awaiting confirmation:" in line for line in first_console.print_calls)
+
+    manager = ContextManager(storage=storage, token_counter=FakeTokenCounter("gpt-4.1-mini"))
+    built = manager.build_messages(session_id, storage.load_message_records(session_id))
+    system_contents = [message["content"] for message in built.messages if message["role"] == "system"]
+    non_system_contents = [message["content"] for message in built.messages if message["role"] != "system"]
+
+    assert any("awaiting_confirmation: yes" in content for content in system_contents)
+    assert any("pending_stage: execution" in content for content in system_contents)
+    assert (
+        "Build a persisted FSM for task state and continue automatically."
+        not in non_system_contents
+    )
+
+    second_console = FakeConsole(inputs=["yes", "/exit"])
+    monkeypatch.setattr(cli, "console", second_console)
+
+    cli._chat_loop(
+        model=ConfirmingTaskStateModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    resumed_state = storage.get_task_state(session_id)
+    assert resumed_state is not None
+    assert resumed_state.stage == "execution"
+    assert resumed_state.is_paused is False
+    assert resumed_state.awaiting_confirmation is False
+    assert resumed_state.current_step == "Implement automatic task transitions"
+    assert resumed_state.expected_action == "Validate resumed task flow"
+    assert any("Task transition confirmed." in line for line in second_console.print_calls)
+    assert any("Continuing from the approved state." in line for line in second_console.print_calls)
+    assert any("Stage: execution" in line for line in second_console.print_calls)
+
+
+def test_chat_loop_streams_visible_reply_without_task_metadata(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=1,
+    )
+
+    fake_console = FakeConsole(inputs=["Start task streaming", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=StreamingTaskProtocolModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    printed_output = "".join(fake_console.print_calls)
+    assert "Streaming answer before metadata." in printed_output
+    assert "<<TASK_STATE>>" not in printed_output
+    assert "current_step: Stream the visible reply" not in printed_output
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is None
+
+
+def test_chat_loop_streams_visible_reply_and_applies_metadata_in_task_mode(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session(
+        "You are test assistant.",
+        token_count=5,
+        context_strategy="sliding",
+        context_window_messages=1,
+    )
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Prepare the first execution step",
+    )
+
+    fake_console = FakeConsole(inputs=["Start task streaming", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=StreamingTaskProtocolModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    printed_output = "".join(fake_console.print_calls)
+    assert "Streaming answer before metadata." in printed_output
+    assert "<<TASK_STATE>>" not in printed_output
+    assert "current_step: Stream the visible reply" not in printed_output
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "execution"
+    assert task_state.current_step == "Stream the visible reply"
+    assert task_state.expected_action == "Persist the task state"
 
 
 def test_token_demo_command(monkeypatch) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .storage import ChatStorage, MessageRecord, SessionContextConfig
+from .storage import ChatStorage, MessageRecord, SessionContextConfig, TaskStateRecord
 from .tokens import TokenCounter
 from .user_profile import UserProfile
 
@@ -112,13 +112,14 @@ class ContextManager:
                 message_records=message_records,
             )
             return ContextBuildResult(
-                messages=self._inject_user_profile(messages),
+                messages=self._inject_persistent_state(session_id, messages),
                 summarized_chunks=summarized_chunks,
             )
 
         if config.strategy == "sliding":
             return ContextBuildResult(
-                messages=self._inject_user_profile(
+                messages=self._inject_persistent_state(
+                    session_id,
                     self._build_sliding_messages(message_records, config.window_messages)
                 ),
                 summarized_chunks=0,
@@ -127,7 +128,8 @@ class ContextManager:
         if config.strategy == "facts":
             self._refresh_facts(session_id=session_id, message_records=message_records)
             return ContextBuildResult(
-                messages=self._inject_user_profile(
+                messages=self._inject_persistent_state(
+                    session_id,
                     self._build_fact_messages(session_id, message_records, config.window_messages)
                 ),
                 summarized_chunks=0,
@@ -136,7 +138,8 @@ class ContextManager:
         if config.strategy == "memory":
             self._refresh_memory_layers(session_id=session_id, message_records=message_records)
             return ContextBuildResult(
-                messages=self._inject_user_profile(
+                messages=self._inject_persistent_state(
+                    session_id,
                     self._build_memory_messages(
                         session_id=session_id,
                         message_records=message_records,
@@ -148,18 +151,28 @@ class ContextManager:
 
         if config.strategy == "branching":
             return ContextBuildResult(
-                messages=self._inject_user_profile(
+                messages=self._inject_persistent_state(
+                    session_id,
                     self._build_branch_messages(session_id, message_records)
                 ),
                 summarized_chunks=0,
             )
 
         return ContextBuildResult(
-            messages=self._inject_user_profile(
+            messages=self._inject_persistent_state(
+                session_id,
                 [{"role": row.role, "content": row.content} for row in message_records]
             ),
             summarized_chunks=0,
         )
+
+    def _inject_persistent_state(
+        self,
+        session_id: str,
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        with_profile = self._inject_user_profile(messages)
+        return self._inject_task_state(session_id, with_profile)
 
     def _inject_user_profile(
         self,
@@ -172,6 +185,24 @@ class ContextManager:
         insert_at = 1 if messages and messages[0]["role"] == "system" else 0
         result = list(messages)
         result.insert(insert_at, profile_message)
+        return result
+
+    def _inject_task_state(
+        self,
+        session_id: str,
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        task_state = self._storage.get_task_state(session_id)
+        if task_state is None:
+            return messages
+
+        task_state_message = {
+            "role": "system",
+            "content": self._format_task_state_message(task_state),
+        }
+        insert_at = 1 if messages and messages[0]["role"] == "system" else 0
+        result = list(messages)
+        result.insert(insert_at, task_state_message)
         return result
 
     def _build_sliding_messages(
@@ -488,3 +519,28 @@ class ContextManager:
                 normalized = normalized[:157] + "..."
             lines.append(f"{role}: {normalized}")
         return " | ".join(lines)
+
+    @staticmethod
+    def _format_task_state_message(task_state: TaskStateRecord) -> str:
+        status = "paused" if task_state.is_paused else "active"
+        lines = [
+            "Task state:",
+            f"stage: {task_state.stage}",
+            f"status: {status}",
+            f"current_step: {task_state.current_step}",
+            f"expected_action: {task_state.expected_action}",
+        ]
+        if task_state.awaiting_confirmation:
+            lines.extend(
+                [
+                    "awaiting_confirmation: yes",
+                    f"pending_stage: {task_state.pending_stage}",
+                    f"pending_current_step: {task_state.pending_current_step}",
+                    f"pending_expected_action: {task_state.pending_expected_action}",
+                    f"pending_confirmation_prompt: {task_state.pending_confirmation_prompt}",
+                ]
+            )
+        lines.append(
+            "Continue from this state and do not ask the user to repeat already known task context."
+        )
+        return "\n".join(lines)

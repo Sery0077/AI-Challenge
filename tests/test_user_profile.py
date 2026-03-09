@@ -74,7 +74,7 @@ class ProfileAwareFakeModel:
                 message.get("content", "")
                 for message in messages
                 if message.get("role") == "system"
-                and message.get("content", "").startswith("User profile:")
+                and "User profile:" in message.get("content", "")
             ),
             "",
         )

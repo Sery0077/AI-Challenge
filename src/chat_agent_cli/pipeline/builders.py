@@ -116,21 +116,50 @@ class TaskProtocolSystemPromptBuilder:
             {
                 "role": "system",
                 "content": (
-                    "Task transition protocol:\n"
-                    "Return exactly one metadata block at the end of every answer.\n"
+                    "Протокол переходов задачи:\n"
+                    "Возвращай ровно один metadata-блок в конце каждого ответа.\n"
                     "<<TASK_STATE>>\n"
                     "stage: planning|execution|validation|done\n"
                     "current_step: short sentence\n"
                     "expected_action: short sentence\n"
                     "transition: auto|confirm\n"
+                    "invariants_status: satisfied|conflict when active invariants exist\n"
+                    "violated_invariants: comma-separated items or none when active invariants exist\n"
+                    "refusal_reason: short sentence when invariants_status=conflict\n"
                     "confirm_prompt: short question when transition=confirm\n"
                     "<<END_TASK_STATE>>\n"
-                    "Rules:\n"
-                    "- Keep all user-visible text outside the metadata block.\n"
-                    "- Use transition=auto when the task can continue without user approval.\n"
-                    "- Use transition=confirm when you want explicit approval before applying a transition.\n"
-                    "- If task state already exists, continue from it instead of restarting.\n"
-                    "- If task state is missing, do not emit the metadata block."
+                    "Правила:\n"
+                    "- Держи весь видимый для пользователя текст вне metadata-блока.\n"
+                    "- Используй transition=auto, когда задачу можно продолжать без дополнительного подтверждения пользователя.\n"
+                    "- Используй transition=confirm, когда перед переходом нужно явное подтверждение пользователя.\n"
+                    "- Если состояние задачи уже существует, продолжай от него, а не начинай заново.\n"
+                    "- Если состояние задачи отсутствует, не выводи metadata-блок.\n"
+                    "- Если есть активные инварианты, проверяй их перед каждым предложением плана, действием или переходом состояния.\n"
+                    "- Если запрос конфликтует с инвариантом, откажись от конфликтующего решения, объясни причину и установи invariants_status=conflict."
+                ),
+            }
+        ]
+
+
+class TaskInvariantSystemPromptBuilder:
+    def supports_phase(self, phase: str) -> bool:
+        return phase != "default"
+
+    def build_messages(self, context: PromptBuildContext) -> list[dict[str, str]]:
+        if context.task_state is None or not context.invariants:
+            return []
+        invariant_lines = "\n".join(
+            f"- {item.category}: {item.text}" for item in context.invariants
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Активные инварианты задачи:\n"
+                    f"{invariant_lines}\n"
+                    "Ты обязан явно учитывать эти инварианты в ответе.\n"
+                    "Перед тем как предлагать план, шаг реализации или переход состояния, проверь, что предложение соблюдает каждый инвариант.\n"
+                    "Если запрос пользователя конфликтует с инвариантом, откажись от конфликтующего решения, назови нарушенный инвариант, ясно объясни отказ и предлагай только совместимую альтернативу."
                 ),
             }
         ]

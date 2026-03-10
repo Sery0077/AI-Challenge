@@ -267,6 +267,33 @@ def test_task_state_roundtrip_and_pause_flow(tmp_path) -> None:
     assert stored.awaiting_confirmation is False
 
 
+def test_session_invariants_roundtrip(tmp_path) -> None:
+    db_path = tmp_path / "history.db"
+    storage = ChatStorage(str(db_path))
+    storage.init()
+
+    session_id = storage.create_session("System prompt", token_count=3)
+    storage.add_session_invariant(
+        session_id,
+        category="architecture",
+        text="Keep the assistant as a terminal-first CLI.",
+    )
+    storage.add_session_invariant(
+        session_id,
+        category="stack",
+        text="Do not add dependencies outside the Python standard library.",
+    )
+
+    invariants = storage.list_session_invariants(session_id)
+    assert [(item.category, item.text) for item in invariants] == [
+        ("architecture", "Keep the assistant as a terminal-first CLI."),
+        ("stack", "Do not add dependencies outside the Python standard library."),
+    ]
+
+    storage.clear_session_invariants(session_id)
+    assert storage.list_session_invariants(session_id) == []
+
+
 def test_task_state_pending_transition_roundtrip(tmp_path) -> None:
     db_path = tmp_path / "history.db"
     storage = ChatStorage(str(db_path))

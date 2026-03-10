@@ -45,6 +45,13 @@ def _normalize_task_field(field_name: str, value: str) -> str:
     return normalized
 
 
+def _normalize_invariant_category(category: str) -> str:
+    normalized = normalize_text(category).strip().lower()
+    if not normalized:
+        raise ValueError("Invariant category cannot be empty")
+    return normalized
+
+
 @dataclass(slots=True)
 class SessionSummary:
     session_id: str
@@ -102,6 +109,12 @@ class SessionFactRecord:
 class MemoryRecord:
     key: str
     value: str
+
+
+@dataclass(slots=True)
+class SessionInvariantRecord:
+    category: str
+    text: str
 
 
 @dataclass(slots=True)
@@ -222,6 +235,19 @@ class ChatStorage:
                     session_id INTEGER NOT NULL,
                     memory_key TEXT NOT NULL,
                     memory_value TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_invariants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    invariant_text TEXT NOT NULL,
                     position INTEGER NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
@@ -638,6 +664,82 @@ class ChatStorage:
             session_id=session_id,
             table_name="session_long_term_memory",
         )
+
+    def add_session_invariant(
+        self,
+        session_id: str,
+        category: str,
+        text: str,
+    ) -> SessionInvariantRecord:
+        normalized_category = _normalize_invariant_category(category)
+        normalized_text = _normalize_task_field("invariant", text)
+        now = _now_iso()
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            row = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) FROM session_invariants WHERE session_id = ?",
+                (db_session_id,),
+            ).fetchone()
+            next_position = int(row[0]) + 1 if row is not None else 1
+            conn.execute(
+                """
+                INSERT INTO session_invariants (
+                    session_id,
+                    category,
+                    invariant_text,
+                    position,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    db_session_id,
+                    normalized_category,
+                    normalized_text,
+                    next_position,
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
+        return SessionInvariantRecord(
+            category=normalized_category,
+            text=normalized_text,
+        )
+
+    def list_session_invariants(self, session_id: str) -> list[SessionInvariantRecord]:
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT si.category, si.invariant_text
+                FROM session_invariants si
+                JOIN sessions s ON s.id = si.session_id
+                WHERE s.session_key = ?
+                ORDER BY si.position ASC, si.id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            SessionInvariantRecord(category=str(row[0]), text=str(row[1]))
+            for row in rows
+        ]
+
+    def clear_session_invariants(self, session_id: str) -> None:
+        now = _now_iso()
+        with sqlite3.connect(self._path) as conn:
+            db_session_id = self._get_db_session_id(conn, session_id)
+            conn.execute(
+                "DELETE FROM session_invariants WHERE session_id = ?",
+                (db_session_id,),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                (now, session_id),
+            )
+            conn.commit()
 
     def get_task_state(self, session_id: str) -> TaskStateRecord | None:
         with sqlite3.connect(self._path) as conn:

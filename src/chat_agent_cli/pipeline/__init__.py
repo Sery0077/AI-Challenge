@@ -2,6 +2,7 @@ from .builders import (
     ExecutionStageSystemPromptBuilder,
     MergeSystemMessagesBuilder,
     PlanningStageSystemPromptBuilder,
+    TaskInvariantSystemPromptBuilder,
     TaskProtocolSystemPromptBuilder,
 )
 from .engine import build_turn_messages, parse_model_response
@@ -17,7 +18,9 @@ from .registry import (
 )
 from .types import (
     AgentTaskUpdate,
+    InvariantCheckResult,
     PromptBuildContext,
+    ResponseContractViolation,
     ResponseParseResult,
     ResponseValidationContext,
 )
@@ -30,14 +33,21 @@ from .user_intents import (
     get_user_intent_parsers,
     parse_user_intent,
 )
-from .validators import MetadataTaskUpdateValidator, PlanningPlainTextTaskUpdateValidator
-from .validators import ExecutionStructuredTaskUpdateValidator
+from .validators import (
+    ExecutionStructuredTaskUpdateValidator,
+    InvariantConflictValidator,
+    MetadataTaskUpdateValidator,
+    PlanningPlainTextTaskUpdateValidator,
+    ResponseContractValidator,
+)
 
 __all__ = [
     "AgentTaskUpdate",
     "ExecutionCompletionIntentParser",
     "ExecutionStructuredTaskUpdateValidator",
     "ExecutionStageSystemPromptBuilder",
+    "InvariantCheckResult",
+    "InvariantConflictValidator",
     "MergeSystemMessagesBuilder",
     "MetadataTaskUpdateValidator",
     "PROMPT_BUILDERS",
@@ -46,12 +56,15 @@ __all__ = [
     "PromptBuildContext",
     "PromptBuilder",
     "RESPONSE_VALIDATORS",
+    "ResponseContractValidator",
+    "ResponseContractViolation",
     "ResponseParseResult",
     "ResponseValidationContext",
     "ResponseValidator",
     "SYSTEM_PROMPT_BUILDERS",
     "USER_INTENT_PARSERS",
     "SystemPromptBuilder",
+    "TaskInvariantSystemPromptBuilder",
     "TaskProtocolSystemPromptBuilder",
     "UserIntentContext",
     "UserIntentParser",

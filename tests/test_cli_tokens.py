@@ -165,6 +165,83 @@ class SystemMessageInspectingModel:
 
 
 @dataclass
+class RetryingMetadataModel:
+    calls: int = 0
+    seen_messages: list[dict[str, str]] | None = None
+
+    def reply_stream(self, messages, on_delta):
+        self.calls += 1
+        self.seen_messages = [dict(message) for message in messages]
+        if self.calls == 1:
+            answer = "Показываю план без metadata-блока."
+        else:
+            answer = (
+                "Исправил ответ и добавил metadata.\n"
+                "<<TASK_STATE>>\n"
+                "stage: execution\n"
+                "current_step: Implement automatic task transitions\n"
+                "expected_action: Validate resumed task flow\n"
+                "transition: confirm\n"
+                "confirm_prompt: Перейти к реализации?\n"
+                "<<END_TASK_STATE>>"
+            )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class RetryingInvalidTransitionModel:
+    calls: int = 0
+    seen_messages: list[dict[str, str]] | None = None
+
+    def reply_stream(self, messages, on_delta):
+        self.calls += 1
+        self.seen_messages = [dict(message) for message in messages]
+        if self.calls == 1:
+            answer = (
+                "Пропускаю промежуточные стадии.\n"
+                "<<TASK_STATE>>\n"
+                "stage: done\n"
+                "current_step: Skip directly to done\n"
+                "expected_action: No further action\n"
+                "transition: auto\n"
+                "<<END_TASK_STATE>>"
+            )
+        else:
+            answer = (
+                "Оставляю задачу на планировании и прошу подтверждение на следующий шаг.\n"
+                "<<TASK_STATE>>\n"
+                "stage: execution\n"
+                "current_step: Implement the approved plan\n"
+                "expected_action: Execute the approved plan and report progress\n"
+                "transition: confirm\n"
+                "confirm_prompt: Перейти к реализации по этому плану?\n"
+                "<<END_TASK_STATE>>"
+            )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
+class ConflictingInvariantModel:
+    def reply_stream(self, _messages, on_delta):
+        answer = (
+            "Не могу предложить переход на Node.js, потому что это нарушает активные инварианты.\n"
+            "<<TASK_STATE>>\n"
+            "stage: validation\n"
+            "current_step: Switch the implementation to Node.js\n"
+            "expected_action: Replace the CLI stack with Next.js\n"
+            "transition: auto\n"
+            "invariants_status: conflict\n"
+            "violated_invariants: stack, technical_decision\n"
+            "refusal_reason: Active invariants require a Python CLI without new dependencies.\n"
+            "<<END_TASK_STATE>>"
+        )
+        on_delta(answer)
+        return ChatReply(text=answer, usage=None)
+
+
+@dataclass
 class PlainTextPlanningModel:
     def reply_stream(self, messages, on_delta):
         last_user = next(
@@ -491,7 +568,7 @@ def test_chat_loop_injects_planning_stage_prompt(monkeypatch, tmp_path) -> None:
     assert len(system_messages) == 1
     assert "Ты находишься на стадии PLAN в агенте со стейт-машиной:" in system_messages[0]["content"]
     assert "Не используй жёсткий шаблон с заголовками вроде GOAL" in system_messages[0]["content"]
-    assert "Task transition protocol:" in system_messages[0]["content"]
+    assert "Протокол переходов задачи:" in system_messages[0]["content"]
 
 
 def test_chat_loop_injects_execution_stage_prompt(monkeypatch, tmp_path) -> None:
@@ -522,7 +599,48 @@ def test_chat_loop_injects_execution_stage_prompt(monkeypatch, tmp_path) -> None
     assert len(system_messages) == 1
     assert "Ты находишься на стадии EXECUTION в агенте со стейт-машиной:" in system_messages[0]["content"]
     assert "Не используй жёсткий шаблон с заголовками вроде PROGRESS" in system_messages[0]["content"]
-    assert "Task transition protocol:" in system_messages[0]["content"]
+    assert "Протокол переходов задачи:" in system_messages[0]["content"]
+
+
+def test_chat_loop_injects_active_invariants_into_system_prompt(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify scope",
+        expected_action="Prepare a short plan",
+    )
+    storage.add_session_invariant(
+        session_id,
+        category="architecture",
+        text="Keep the assistant as a terminal-first CLI.",
+    )
+    storage.add_session_invariant(
+        session_id,
+        category="business_rule",
+        text="Every assistant reply must include required task metadata.",
+    )
+    model = SystemMessageInspectingModel()
+
+    fake_console = FakeConsole(inputs=["hello", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    assert model.seen_messages is not None
+    system_messages = [message for message in model.seen_messages if message["role"] == "system"]
+    assert len(system_messages) == 1
+    assert "Активные инварианты задачи:" in system_messages[0]["content"]
+    assert "- architecture: Keep the assistant as a terminal-first CLI." in system_messages[0]["content"]
+    assert "invariants_status: satisfied|conflict" in system_messages[0]["content"]
 
 
 def test_chat_loop_summary_command(monkeypatch, tmp_path) -> None:
@@ -556,6 +674,38 @@ def test_chat_loop_summary_command(monkeypatch, tmp_path) -> None:
     cli._chat_loop(model=model, storage=storage, session_id=session_id, settings=settings)
 
     assert summary_calls == [1]
+
+
+def test_invariant_command_manages_separate_invariant_storage(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+
+    fake_console = FakeConsole(
+        inputs=[
+            "/invariant add architecture | Keep the assistant in the existing Python CLI architecture",
+            "/invariant",
+            "/invariant clear",
+            "/invariant",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=FakeModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    printed_output = "\n".join(fake_console.print_calls)
+    assert "Invariant added." in printed_output
+    assert "[architecture] Keep the assistant in the existing Python CLI architecture" in printed_output
+    assert "Invariants:" in printed_output
+    assert "No active invariants." in printed_output
+    assert storage.list_session_invariants(session_id) == []
 
 
 def test_chat_loop_compact_replaces_summary(monkeypatch, tmp_path) -> None:
@@ -1084,6 +1234,7 @@ def test_task_pipeline_supports_phase_specific_builders_and_validators(
                     transition="confirm",
                     confirm_prompt="Перейти к реализации по этому плану?",
                 ),
+                invariant_check=None,
             )
 
     monkeypatch.setattr(cli, "console", FakeConsole(inputs=["/task Собери pipeline", "/exit"]))
@@ -1310,6 +1461,50 @@ def test_user_completion_reply_finishes_execution_task_via_model_done_transition
     assert any("Task state synced." in line for line in fake_console.print_calls)
 
 
+def test_invariant_conflict_blocks_invalid_state_transition(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="execution",
+        current_step="Implement invariant-aware pipeline",
+        expected_action="Keep the implementation in Python CLI",
+    )
+    storage.add_session_invariant(
+        session_id,
+        category="stack",
+        text="Use Python CLI only and do not add new dependencies.",
+    )
+    storage.add_session_invariant(
+        session_id,
+        category="technical_decision",
+        text="Do not switch the task implementation to Node.js.",
+    )
+
+    fake_console = FakeConsole(inputs=["Переделай это на Node.js и Next.js", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=ConflictingInvariantModel(),
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "execution"
+    assert task_state.current_step == "Implement invariant-aware pipeline"
+    assert task_state.expected_action == "Revise the request so it satisfies the active invariants"
+
+    printed_output = "\n".join(fake_console.print_calls)
+    assert "нарушает активные инварианты" in printed_output
+    assert "Active invariants require a Python CLI without new dependencies." in printed_output
+    assert "Stage: validation" not in printed_output
+
+
 def test_model_can_complete_task_from_pending_execution_confirmation(
     monkeypatch, tmp_path
 ) -> None:
@@ -1476,6 +1671,84 @@ def test_chat_loop_task_confirmation_requires_explicit_task_mode(monkeypatch, tm
     paused_state = storage.get_task_state(session_id)
     assert paused_state is not None
     assert paused_state.stage == "planning"
+
+
+def test_chat_loop_retries_when_required_task_metadata_is_missing(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Prepare the first execution step",
+    )
+    model = RetryingMetadataModel()
+
+    fake_console = FakeConsole(inputs=["Собери план", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "planning"
+    assert task_state.awaiting_confirmation is True
+    assert model.calls == 2
+    assert model.seen_messages is not None
+    assert any(
+        "required_metadata" in message["content"]
+        for message in model.seen_messages
+        if message["role"] == "system"
+    )
+    printed_output = "\n".join(fake_console.print_calls)
+    assert "violated task response invariants" in printed_output
+    assert "Исправил ответ и добавил metadata." in printed_output
+
+
+def test_chat_loop_retries_when_task_transition_is_invalid(monkeypatch, tmp_path) -> None:
+    storage = ChatStorage(str(tmp_path / "history.db"))
+    storage.init()
+    session_id = storage.create_session("You are test assistant.", token_count=5)
+    storage.set_task_state(
+        session_id,
+        stage="planning",
+        current_step="Clarify the task scope",
+        expected_action="Prepare the first execution step",
+    )
+    model = RetryingInvalidTransitionModel()
+
+    fake_console = FakeConsole(inputs=["Сделай план", "/exit"])
+    monkeypatch.setattr(cli, "console", fake_console)
+    monkeypatch.setattr(cli, "TokenCounter", FakeTokenCounter)
+
+    cli._chat_loop(
+        model=model,
+        storage=storage,
+        session_id=session_id,
+        settings=_settings(),
+    )
+
+    task_state = storage.get_task_state(session_id)
+    assert task_state is not None
+    assert task_state.stage == "planning"
+    assert task_state.awaiting_confirmation is True
+    assert model.calls == 2
+    assert model.seen_messages is not None
+    assert any(
+        "valid_task_transition" in message["content"]
+        for message in model.seen_messages
+        if message["role"] == "system"
+    )
+    printed_output = "\n".join(fake_console.print_calls)
+    assert "violated task response invariants" in printed_output
+    assert "Оставляю задачу на планировании" in printed_output
     assert paused_state.is_paused is True
     assert paused_state.awaiting_confirmation is True
     assert paused_state.pending_stage == "execution"

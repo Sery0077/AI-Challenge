@@ -15,6 +15,7 @@ from .context import ContextManager
 from .llm import ChatModel
 from .pipeline import (
     AgentTaskUpdate,
+    ResponseContractViolation,
     build_turn_messages,
     parse_model_response,
 )
@@ -22,10 +23,11 @@ from .storage import (
     BranchRecord,
     ChatStorage,
     MemoryRecord,
+    SessionInvariantRecord,
     SessionSummary,
     SessionSummaryRecord,
-    TaskStateRecord,
     SessionTokenStats,
+    TaskStateRecord,
 )
 from .text import normalize_text
 from .tokens import ModelPricing, TokenCounter
@@ -236,6 +238,17 @@ def _parse_task_set_command(payload: str) -> tuple[str, str, str]:
     return normalized_stage, current_step, expected_action
 
 
+def _parse_invariant_add_command(payload: str) -> tuple[str, str]:
+    category, separator, text = payload.partition("|")
+    if not separator:
+        raise ValueError("Use /invariant add <category> | <text>")
+    normalized_category = normalize_text(category).strip()
+    normalized_text = normalize_text(text).strip()
+    if not normalized_category or not normalized_text:
+        raise ValueError("Invariant category and text cannot be empty")
+    return normalized_category, normalized_text
+
+
 def _build_task_goal_state(goal: str) -> tuple[str, str, str]:
     normalized_goal = normalize_text(goal).strip()
     if not normalized_goal:
@@ -265,6 +278,19 @@ def _format_task_state(task_state: TaskStateRecord) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+def _format_invariants(invariants: list[SessionInvariantRecord]) -> str:
+    if not invariants:
+        return "No active invariants."
+    return "\n".join(
+        f"{index}. [{item.category}] {item.text}"
+        for index, item in enumerate(invariants, start=1)
+    )
+
+
+def _print_invariants(invariants: list[SessionInvariantRecord]) -> None:
+    console.print(f"[cyan]Invariants:[/cyan] {_safe_console_text(_format_invariants(invariants))}")
 
 
 def _print_task_state(task_state: TaskStateRecord | None) -> None:
@@ -380,6 +406,53 @@ def _task_bootstrap_user_text() -> str:
     )
 
 
+def _build_contract_retry_message(violations: tuple[ResponseContractViolation, ...]) -> dict[str, str]:
+    lines = [
+        "Исправь предыдущий ответ.",
+        "Ты нарушил обязательные кодовые инварианты ответа для task pipeline:",
+    ]
+    for item in violations:
+        lines.append(f"- {item.code}: {item.message}")
+    lines.extend(
+        [
+            "Сформируй новый ответ полностью заново.",
+            "Обязательно верни корректный metadata-блок и только допустимый переход состояния.",
+        ]
+    )
+    return {"role": "system", "content": "\n".join(lines)}
+
+
+def _request_model_reply(
+    *,
+    model: ChatModel,
+    messages: list[dict[str, str]],
+    task_state: TaskStateRecord | None,
+    invariants,
+) -> tuple[object, object, object]:
+    last_parsed_reply = None
+    for attempt in range(2):
+        console.print("[bold blue]Assistant:[/bold blue] ", end="")
+        stream_printer = _TaskAwareStreamPrinter()
+        reply = model.reply_stream(
+            messages,
+            on_delta=stream_printer.push,
+        )
+        stream_printer.finish()
+        parsed_reply = parse_model_response(reply.text, task_state, invariants=invariants)
+        last_parsed_reply = parsed_reply
+        if not stream_printer.printed_anything and parsed_reply.assistant_text:
+            console.print(parsed_reply.assistant_text, end="", markup=False, highlight=False)
+        console.print()
+        if not parsed_reply.contract_violations or attempt == 1:
+            return reply, stream_printer, parsed_reply
+        console.print(
+            "[yellow]Model response violated task response invariants. Retrying with corrective prompt.[/yellow]"
+        )
+        messages = [*messages, {"role": "assistant", "content": reply.text}, _build_contract_retry_message(parsed_reply.contract_violations)]
+        console.print()
+    raise RuntimeError(f"Unreachable retry state: {last_parsed_reply}")
+
+
 def _run_model_turn(
     *,
     model: ChatModel,
@@ -399,7 +472,8 @@ def _run_model_turn(
         session_id=session_id,
         message_records=message_records,
     )
-    messages = build_turn_messages(context.messages, task_state)
+    invariants = storage.list_session_invariants(session_id)
+    messages = build_turn_messages(context.messages, task_state, invariants=invariants)
     estimated_prompt_tokens = token_counter.count_messages(messages)
     if estimated_prompt_tokens > settings.model_context_limit:
         console.print(
@@ -411,13 +485,12 @@ def _run_model_turn(
         )
 
     try:
-        console.print("[bold blue]Assistant:[/bold blue] ", end="")
-        stream_printer = _TaskAwareStreamPrinter()
-        reply = model.reply_stream(
-            messages,
-            on_delta=stream_printer.push,
+        reply, _stream_printer, parsed_reply = _request_model_reply(
+            model=model,
+            messages=messages,
+            task_state=task_state,
+            invariants=invariants,
         )
-        stream_printer.finish()
     except BadRequestError as exc:  # pragma: no cover
         error_text = str(exc)
         if "maximum context length" in error_text.lower() or "context_length_exceeded" in error_text.lower():
@@ -440,12 +513,8 @@ def _run_model_turn(
         console.print()
         return task_state, storage.load_message_records(session_id)
 
-    parsed_reply = parse_model_response(reply.text, task_state)
     assistant_text = parsed_reply.assistant_text
     task_update = parsed_reply.task_update
-    if not stream_printer.printed_anything and assistant_text:
-        console.print(assistant_text, end="", markup=False, highlight=False)
-    console.print()
     next_task_state = _apply_agent_task_update(storage, session_id, task_update)
     if next_task_state is not None:
         console.print("[dim]Task state synced.[/dim]")
@@ -559,7 +628,7 @@ def _chat_loop(
             title += " paused"
     commands_line = (
         "Commands: /exit, /clear, /debug, /stats, /summary, /compact, /model, "
-        "/task, /pause, /continue"
+        "/task, /pause, /continue, /invariant"
     )
     if branch_commands_enabled:
         commands_line += ", /checkpoint, /branch, /branches, /switch"
@@ -708,6 +777,41 @@ def _chat_loop(
                         session_config=session_config,
                         message_records=message_records,
                     )
+                continue
+            if command == "/invariant":
+                payload = user_text[len("/invariant"):].strip()
+                if not payload:
+                    _print_invariants(storage.list_session_invariants(session_id))
+                    console.print()
+                    continue
+                lowered_payload = payload.lower()
+                if lowered_payload == "clear":
+                    storage.clear_session_invariants(session_id)
+                    console.print("[yellow]Invariants cleared.[/yellow]")
+                    console.print()
+                    continue
+                if lowered_payload.startswith("add "):
+                    try:
+                        category, text = _parse_invariant_add_command(payload[4:].strip())
+                        invariant = storage.add_session_invariant(
+                            session_id=session_id,
+                            category=category,
+                            text=text,
+                        )
+                    except ValueError as exc:
+                        console.print(f"[bold red]Invariant update failed:[/bold red] {exc}")
+                        console.print()
+                        continue
+                    console.print(
+                        "[yellow]Invariant added.[/yellow] "
+                        f"[{invariant.category}] {_safe_console_text(invariant.text)}"
+                    )
+                    console.print()
+                    continue
+                console.print(
+                    "[yellow]Usage: /invariant | /invariant add <category> | <text> | /invariant clear[/yellow]"
+                )
+                console.print()
                 continue
             if command == "/pause":
                 pause_action = user_text[len("/pause"):].strip() or None
@@ -898,7 +1002,7 @@ def _chat_loop(
             console.print(
                 "[yellow]Unknown command. Available commands: "
                 "/exit, /clear, /debug, /stats, /summary, /compact, /model, "
-                "/task, /pause, /continue, "
+                "/task, /pause, /continue, /invariant, "
                 "/memory, /checkpoint, /branch, /branches, /switch[/yellow]"
             )
             console.print()
@@ -934,7 +1038,8 @@ def _chat_loop(
             session_id=session_id,
             message_records=message_records,
         )
-        messages = build_turn_messages(context.messages, task_state)
+        invariants = storage.list_session_invariants(session_id)
+        messages = build_turn_messages(context.messages, task_state, invariants=invariants)
         estimated_prompt_tokens = token_counter.count_messages(messages)
         if estimated_prompt_tokens > settings.model_context_limit:
             console.print(
@@ -946,13 +1051,12 @@ def _chat_loop(
             )
 
         try:
-            console.print("[bold blue]Assistant:[/bold blue] ", end="")
-            stream_printer = _TaskAwareStreamPrinter()
-            reply = model.reply_stream(
-                messages,
-                on_delta=stream_printer.push,
+            reply, _stream_printer, parsed_reply = _request_model_reply(
+                model=model,
+                messages=messages,
+                task_state=task_state,
+                invariants=invariants,
             )
-            stream_printer.finish()
         except BadRequestError as exc:  # pragma: no cover
             error_text = str(exc)
             if "maximum context length" in error_text.lower() or "context_length_exceeded" in error_text.lower():
@@ -977,12 +1081,8 @@ def _chat_loop(
             message_records = storage.load_message_records(session_id)
             continue
 
-        parsed_reply = parse_model_response(reply.text, task_state)
         assistant_text = parsed_reply.assistant_text
         task_update = parsed_reply.task_update
-        if not stream_printer.printed_anything and assistant_text:
-            console.print(assistant_text, end="", markup=False, highlight=False)
-        console.print()
         task_state = _apply_agent_task_update(storage, session_id, task_update)
         if task_state is not None:
             console.print("[dim]Task state synced.[/dim]")

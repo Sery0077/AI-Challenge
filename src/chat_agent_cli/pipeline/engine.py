@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..storage import TaskStateRecord
+from ..storage import SessionInvariantRecord, TaskStateRecord
 from ..text import normalize_text
 from .interfaces import PromptBuilder, ResponseValidator, SystemPromptBuilder
 from .phases import detect_interaction_phase
@@ -15,11 +15,16 @@ from .types import PromptBuildContext, ResponseParseResult, ResponseValidationCo
 def build_turn_messages(
     messages: list[dict[str, str]],
     task_state: TaskStateRecord | None,
+    invariants: list[SessionInvariantRecord] | None = None,
     system_prompt_builders: list[SystemPromptBuilder] | None = None,
     prompt_builders: list[PromptBuilder] | None = None,
 ) -> list[dict[str, str]]:
     phase = detect_interaction_phase(task_state)
-    context = PromptBuildContext(phase=phase, task_state=task_state)
+    context = PromptBuildContext(
+        phase=phase,
+        task_state=task_state,
+        invariants=list(invariants or []),
+    )
     built_messages = list(messages)
     extra_system_messages: list[dict[str, str]] = []
 
@@ -45,14 +50,21 @@ def build_turn_messages(
 def parse_model_response(
     reply_text: str,
     task_state: TaskStateRecord | None,
+    invariants: list[SessionInvariantRecord] | None = None,
     validators: list[ResponseValidator] | None = None,
 ) -> ResponseParseResult:
     phase = detect_interaction_phase(task_state)
-    context = ResponseValidationContext(phase=phase, task_state=task_state)
+    context = ResponseValidationContext(
+        phase=phase,
+        task_state=task_state,
+        invariants=list(invariants or []),
+    )
     result = ResponseParseResult(
         raw_reply_text=normalize_text(reply_text),
         assistant_text=normalize_text(reply_text).strip(),
         task_update=None,
+        invariant_check=None,
+        contract_violations=(),
     )
     for validator in validators or get_response_validators():
         if validator.supports_phase(phase):
